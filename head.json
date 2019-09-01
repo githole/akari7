@@ -1,0 +1,9 @@
+{
+  "model": "head.obj",
+  "pos": [ 0.01, -0.1, 2.0 ],
+  "dir": [ 0.0, -0.0, -1.0 ],
+  "up": [ 0.0, -1.0, 0.0 ],
+  "fovy": 0.3,
+  "samplePerPixel": 16,
+  "sampleAo" : 1
+}

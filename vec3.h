@@ -35,6 +35,12 @@ namespace hmath
         Vec3& operator=(Vec3&& o) noexcept = default;
 
         // operator
+        template <class E>
+        Vec3& operator=(const E& r) {
+            for (std::size_t i = 0; i < 3; ++i)
+                ((*this)[i]) = r[i];
+            return *this;
+        }
 
         // index‚Ìout-of-range‚Í‚ß‚ñ‚Ç‚¢‚Ì‚Å–³Ž‹B
         Real operator[](size_t i) const

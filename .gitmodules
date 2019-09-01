@@ -4,3 +4,6 @@
 [submodule "external/fmath"]
 	path = external/fmath
 	url = https://github.com/herumi/fmath
+[submodule "external/tinyobjloader"]
+	path = external/tinyobjloader
+	url = https://github.com/syoyo/tinyobjloader

@@ -1,5 +1,5 @@
-#ifndef _BBOX_H_
-#define _BBOX_H_
+#ifndef _LOCALBBOX_H_
+#define _LOCALBBOX_H_
 
 #include "vec3.h"
 

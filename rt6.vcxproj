@@ -119,6 +119,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="etc.cpp" />
+    <ClCompile Include="external\tinyobjloader\tiny_obj_loader.cc" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="test.cpp" />
     <ClCompile Include="XYZ.cpp" />

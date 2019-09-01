@@ -2,6 +2,7 @@
 #define STBI_MSC_SECURE_CRT
 #include "external/stb/stb_image_write.h"
 #include "external/fmath/fmath.hpp"
+#include "external/tinyobjloader/tiny_obj_loader.h"
 
 #include "vec3.h"
 #include "util.h"
@@ -11,11 +12,14 @@
 #include "XYZ.h"
 #include "bbox.h"
 
+#include "hlib/rt/objMesh.h"
+
 #include <iostream>
 #include <thread>
 #include <mutex>
 #include <vector>
 #include <atomic>
+#include <random>
 
 // #define TEST
 
@@ -49,6 +53,83 @@ public:
         return sample_map_[x + y * width_];
     }
 };
+
+namespace mesh
+{
+    struct Material
+    {
+        hmath::Float3 diffuse;
+        hmath::Float3 emission;
+        float ior = 0;
+    };
+    std::vector<Material> material_table;
+
+    struct Mesh
+    {
+        std::vector<float> vertex;
+        std::vector<uint32_t> index;
+        std::vector<uint32_t> material_map;
+    };
+    Mesh loadMesh(const std::string& filename)
+    {
+        // TODO: 外部からなんとかできるようにしたいところではある
+        material_table.clear();
+        material_table.push_back({ hmath::Float3(0.18f, 0.18f, 0.18f), hmath::Float3(0, 0, 0) });
+        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(160, 80, 20) });
+        material_table.push_back({ hmath::Float3(1.0f, 1.0f, 1.0f), hmath::Float3(0, 0, 0), 1.5f });
+
+        std::vector<uint32_t> material_map;
+
+        tinyobj::attrib_t attrib;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn;
+        std::string err;
+        std::vector<uint32_t> indices;
+        tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, filename.c_str(), nullptr, true);
+
+        for (auto& shape : shapes)
+        {
+            // printf("%s\n", shape.name.c_str());
+
+            int current_material = 0;
+
+            if (shape.name == "light")
+            {
+                current_material = 1;
+            }
+            else if (shape.name == "normal")
+            {
+                current_material = 0;
+            }
+            else if (shape.name == "glass")
+            {
+                current_material = 2;
+            }
+
+            for (auto& index : shape.mesh.indices)
+            {
+                indices.push_back(index.vertex_index);
+                material_map.push_back(current_material);
+                // indices.push_back(index.normal_index);
+            }
+        }
+        return { attrib.vertices, indices, material_map };
+    }
+
+    namespace oldlib
+    {
+        struct Triangle
+        {
+            hstd::Float3 v[3];
+            hstd::Float3 n[3];
+            Material* mat;
+        };
+        std::vector<Triangle> triangles;
+        std::vector<hstd::rt::RefTriangle> ref_triangles;
+        hstd::rt::QBVH qbvh;
+    }
+}
 
 namespace
 {
@@ -133,6 +214,11 @@ namespace integrator
     {
         Float3 org;
         Float3 dir;
+        float near = 0;
+        float far = std::numeric_limits<float>::infinity();
+        bool anyhit = false;
+
+        int id = -1;
     };
 
     // from smallpt
@@ -165,6 +251,7 @@ namespace integrator
     struct IntersectionInfo
     {
         bool hit = false;
+        Float3 pos;
         Float3 normal;
         int id = -1;
         float t = std::numeric_limits<float>::infinity();
@@ -173,6 +260,40 @@ namespace integrator
     IntersectionInfo intersect(const Ray &r)
     {
         IntersectionInfo info;
+
+        hstd::rt::Ray ray;
+        ray.org = r.org;
+        ray.dir = r.dir;
+        hstd::rt::Hitpoint hp;
+
+        const auto ret = mesh::oldlib::qbvh.intersect(ray, &hp, r.id, r.anyhit, r.near, r.far);
+
+        if (ret)
+        {
+            info.t = hp.distance;
+            info.id = hp.triangle_index;
+            info.hit = ret;
+
+            auto& triangle = mesh::oldlib::triangles[hp.triangle_index];
+
+            auto e1 = triangle.v[1] - triangle.v[0];
+            auto e2 = triangle.v[2] - triangle.v[0];
+            auto n = hstd::cross(e1, e2);
+            n = hstd::normalize(n);
+            info.normal = n;
+
+            const float u = hp.b1;
+            const float v = hp.b2;
+
+            info.pos =
+                (1 - u - v) * triangle.v[0] +
+                u * triangle.v[1] +
+                v * triangle.v[2];
+        }
+        else
+        {
+            info.hit = false;
+        }
 
         return info;
     }
@@ -189,6 +310,8 @@ namespace integrator
         return tz * normal + tx * tangent + ty * binormal;
     }
 
+    static std::uniform_real_distribution<> dist01(0.0, 1.0);
+
     // ここに素晴らしいintegratorを書く
     Float3 get_radiance(int w, int h, int x, int y, uint64_t seed)
     {
@@ -203,12 +326,13 @@ namespace integrator
         Float3 camera_dir = normalize(Float3(0, 0, 0) - camera_position);
         const float fovy = (90.0f) / 180.0f * hmath::pi<float>();
 #endif
-        Float3 camera_position(15, 9, 10);
-        Float3 camera_dir = normalize(Float3(3, 0, 1) - camera_position);
-        const float fovy = (120.0f) / 180.0f * hmath::pi<float>();
+        Float3 camera_position(34, 15, 32);
+        Float3 camera_dir = normalize(Float3(0, 0, 0) - camera_position);
+        const float fovy = (45.0f) / 180.0f * hmath::pi<float>();
 
-        const float ang = 0.15f;
-        Float3 camera_up(sin(ang), cos(ang), 0);
+        //const float ang = 0.15f;
+        //Float3 camera_up(sin(ang), cos(ang), 0);
+        Float3 camera_up(0, 1, 0);
 
         const auto aspect = (float)w / h;
         const float length = 0.1f;
@@ -220,7 +344,11 @@ namespace integrator
         const float U = ((float)(x + rng.next01()) / w) * 2 - 1;
         const float V = ((float)(y + rng.next01()) / h) * 2 - 1;
         const float r = (U * U + V * V);
+
+        auto new_U = U;
+        auto new_V = V;
 #if 0
+#if 1
         int ch = rng.next() % 3;
         float table[3] = { -0.05f, 0, 0.05f };
         const float k1 = table[ch];
@@ -239,11 +367,143 @@ namespace integrator
         const float a = 2.0f;
         const float final_weight = a / (a + r2);
 #endif
+#endif
 
         const auto initial_pos = camera_position + camera_dir * length + new_U * screen_side + new_V * screen_up;
         const auto initial_dir = normalize(initial_pos - camera_position);
 
-        return {};
+
+        // naive pathtracing
+#if 1
+        integrator::Ray ray;
+        ray.org = initial_pos;
+        ray.dir = initial_dir;
+        Float3 throughput(1, 1, 1);
+        Float3 L(0, 0, 0);
+
+        bool into = true;
+
+        for (int depth = 0; depth < 5; ++depth)
+        {
+            auto info = intersect(ray);
+            if (!info.hit)
+            {
+                // 背景
+                L += product(throughput, Float3(0.01, 0.01, 0.01));
+                break;
+            }
+            ray.org = info.pos;
+            ray.id = info.id;
+
+            auto& triangle = mesh::oldlib::triangles[info.id];
+            auto& material = *triangle.mat;
+
+            if (material.ior == 0)
+            {
+                // 次の方向サンプリング
+                const auto ts = hmath::tangentSpace(info.normal);
+                const Float3 tangent = std::get<0>(ts);
+                const Float3 binormal = std::get<1>(ts);
+                auto next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
+
+                ray.dir = next_dir;
+                L += product(throughput, material.emission);
+                throughput = product(throughput, material.diffuse);
+            }
+            else
+            {
+                integrator::Ray reflection_ray;
+                reflection_ray.org = info.pos;
+                reflection_ray.dir = ray.dir - info.normal * 2.0f * dot(info.normal, ray.dir);
+
+                // Snellの法則
+                const float nc = 1.0; // 真空の屈折率
+                const float nt = material.ior; // オブジェクトの屈折率
+                const float nnt = into ? nc / nt : nt / nc;
+                into = !into;
+
+                const auto orienting_normal = dot(info.normal, ray.dir) < 0.0 ? info.normal : (-1.0f * info.normal);
+                const float ddn = dot(ray.dir, orienting_normal);
+                const float cos2t = 1.0 - nnt * nnt * (1.0 - ddn * ddn);
+
+                if (cos2t < 0.0) { // 全反射
+                    ray = reflection_ray;
+                    continue;
+                }
+
+                // 屈折の方向
+                integrator::Ray refraction_ray;
+                refraction_ray.org = info.pos;
+                refraction_ray.dir = normalize(ray.dir * nnt - info.normal * (into ? 1.0f : -1.0f) * (ddn * nnt + sqrt(cos2t)));
+
+                // SchlickによるFresnelの反射係数の近似を使う
+                const double a = nt - nc, b = nt + nc;
+                const double R0 = (a * a) / (b * b);
+
+                const float c = 1.0 - (into ? -ddn : dot(refraction_ray.dir, -1.0f * orienting_normal));
+                const float Re = R0 + (1.0 - R0) * pow(c, 5.0); // 反射方向の光が反射してray.dirの方向に運ぶ割合。同時に屈折方向の光が反射する方向に運ぶ割合。
+                const float nnt2 = pow(into ? nc / nt : nt / nc, 2.0); // レイの運ぶ放射輝度は屈折率の異なる物体間を移動するとき、屈折率の比の二乗の分だけ変化する。
+                const float Tr = (1.0 - Re) * nnt2; // 屈折方向の光が屈折してray.dirの方向に運ぶ割合
+
+
+                const float probability = 0.25f + 0.5f * Re;
+                if (rng.next01() < probability) { // 反射
+                    ray = reflection_ray;
+                    throughput = product(throughput, Re * material.diffuse / probability);
+                }
+                else
+                {
+                    // 屈折
+                    ray = refraction_ray;
+                    throughput = product(throughput, Tr * material.diffuse / (1.0f - probability));
+                }
+            }
+
+        }
+
+        return L;
+#endif
+#if 0
+        integrator::Ray ray;
+        ray.org = initial_pos;
+        ray.dir = initial_dir;
+
+        auto info = intersect(ray);
+        float occluded = 0;
+        if (info.hit)
+        {
+            auto hitpos = info.pos;
+
+            const auto ts = hmath::tangentSpace(info.normal);
+            const Float3 tangent = std::get<0>(ts);
+            const Float3 binormal = std::get<1>(ts);
+
+            // ao
+            for (int i = 0; i < 16; ++i)
+            {
+                auto next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
+                integrator::Ray aoray;
+
+                aoray.org = hitpos;
+                aoray.dir = next_dir;
+                aoray.id = info.id;
+                aoray.near = 0;
+                aoray.anyhit = true;
+                auto ao_info = intersect(aoray);
+
+                if (ao_info.hit)
+                {
+                    occluded += 1.0 / 16.0f;
+                }
+            }
+        }
+        else
+        {
+            return {};
+        }
+
+        return (1 - occluded) * Float3(1, 1, 1);
+#endif
     }
 }
 
@@ -256,6 +516,45 @@ int main(int argc, char** argv)
 
     FloatImage image(Width, Height);
     bool end_flag = false;
+
+    // メッシュ読み込み
+    printf("Load nad Build.\n");
+//    auto mesh = mesh::loadMesh("head.obj");
+    auto mesh = mesh::loadMesh("C:/Code/VSProjects/pathological_mesher/pathological_mesher/rtcamp.obj");
+    {
+        const auto numFace = mesh.index.size() / 3;
+        mesh::oldlib::triangles.resize(numFace);
+        mesh::oldlib::ref_triangles.resize(numFace);
+        for (size_t i = 0; i < numFace; ++i)
+        {
+            for (int x = 0; x < 3; ++x)
+            {
+                /*
+                mesh::oldlib::triangles[i].v[0][a] = impl::vertices[indices[i * 6 + 0] * 3 + a];
+                mesh::oldlib::triangles[i].v[1][a] = impl::vertices[indices[i * 6 + 2] * 3 + a];
+                mesh::oldlib::triangles[i].v[2][a] = impl::vertices[indices[i * 6 + 4] * 3 + a];
+                mesh::oldlib::triangles[i].n[0][a] = impl::normals[indices[i * 6 + 1] * 3 + a];
+                mesh::oldlib::triangles[i].n[1][a] = impl::normals[indices[i * 6 + 3] * 3 + a];
+                mesh::oldlib::triangles[i].n[2][a] = impl::normals[indices[i * 6 + 5] * 3 + a];
+                */
+
+                mesh::oldlib::triangles[i].v[0][x] = mesh.vertex[mesh.index[i * 3 + 0] * 3 + x];
+                mesh::oldlib::triangles[i].v[1][x] = mesh.vertex[mesh.index[i * 3 + 1] * 3 + x];
+                mesh::oldlib::triangles[i].v[2][x] = mesh.vertex[mesh.index[i * 3 + 2] * 3 + x];
+            }
+
+            mesh::oldlib::triangles[i].mat = &mesh::material_table[
+                mesh.material_map[i * 3 + 0]];
+
+            for (int a = 0; a < 3; ++a)
+            {
+                mesh::oldlib::ref_triangles[i].p[a] = &mesh::oldlib::triangles[i].v[a];
+            }
+            mesh::oldlib::ref_triangles[i].original_triangle_index = i;
+        }
+        mesh::oldlib::qbvh.build(mesh::oldlib::ref_triangles);
+    }
+    printf("Build BVH End.\n");
 
     // 時間監視スレッドを立てる
     std::thread watcher([&end_flag, &image]() {
@@ -271,7 +570,7 @@ int main(int argc, char** argv)
 
             // 15秒経過を計る
             auto current = std::chrono::system_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(current - tick_start).count() >= 1 * 1000) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(current - tick_start).count() >= 3 * 1000) {
                 // 画像出力
                 tick_start = current;
 
@@ -380,7 +679,7 @@ int main(int argc, char** argv)
                             if (end_flag)
                                 return;
 
-                            const int current_seed = ix + iy * 8192 + num_loop;
+                            const int current_seed = (ix + iy * 8192) * 8192 + num_loop;
                             const auto ret = integrator::get_radiance(Width, Height, ix, iy, current_seed);
 
                             if (is_valid(ret)) {
