@@ -1095,7 +1095,6 @@ namespace integrator
     // Ç±Ç±Ç…ëfê∞ÇÁÇµÇ¢integratorÇèëÇ≠
     Float3 get_radiance(const integrator::guiding::Param& p, int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
     {
-
         const float current_time = rng.next01();
 
 #if 0
@@ -1209,8 +1208,9 @@ namespace integrator
 
                     ray.dir = next_dir;
                     L += product(throughput, material.emission);
-                    const float coeff = (float)(dot(info.normal, next_dir) / M_PI / pdf_omega) * MISWeight;
+                    const float coeff = (float)(std::max(0.0f, dot(info.normal, next_dir)) / M_PI / pdf_omega) * MISWeight;
                     throughput = product(throughput, material.diffuse * coeff);
+
                 }
 
                 // guiding
@@ -1612,7 +1612,7 @@ int main(int argc, char** argv)
                 {
                     hmath::Float3 pos, dir;
                     integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
-                    auto ret = integrator::get_radiance(p, tid, rng, pos, dir, loop, num_sample, Width, Height, ix, iy, current_seed);
+                    auto ret = integrator::get_radiance(p, tid, rng, pos, dir, loop, s, num_sample, Width, Height, ix, iy);
 
                     if (is_valid(ret)) {
                         const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
@@ -1679,6 +1679,7 @@ int main(int argc, char** argv)
         if (0)
         {
 
+#if 0
             hmath::Rng rng;
             rng.set_seed(0);
             hmath::Float3 pos, dir;
@@ -1738,7 +1739,8 @@ int main(int argc, char** argv)
                     }
                 }
             }
-#if 0
+#endif
+#if 1
             for (int iy = 0; iy < Height; ++iy)
             {
                 for (int ix = 0; ix < Width; ++ix)
@@ -1760,8 +1762,6 @@ int main(int argc, char** argv)
 
                             if (tree)
                             {
-                                image.samples(ix, iy) = 1;
-
                                 //image(ix, iy) = tree->debug_color;
                                 //image(ix, iy) = hmath::Float3(tree->quad_tree.flux / 10 / num_sample, 0, 0);
                                 
@@ -1770,7 +1770,7 @@ int main(int argc, char** argv)
 
                                 const auto d = (info.pos - aabb.pmin) / (aabb.pmax - aabb.pmin);
                                 const float u = d[0];
-                                const float v = d[2];
+                                const float v = d[1];
 
                                 auto depth = integrator::guiding::calc_depth(u, v, &tree->quad_tree);
 
@@ -1784,9 +1784,9 @@ int main(int argc, char** argv)
                                 };
 
                                 if (depth >= 6)
-                                    image(ix, iy) = hmath::Float3(0.1, 0.1, 0.1);
+                                    result_image(ix, iy) = hmath::Float3(0.1, 0.1, 0.1);
                                 else
-                                    image(ix, iy) = tbl[depth];
+                                    result_image(ix, iy) = tbl[depth];
 
 #endif
                             }
