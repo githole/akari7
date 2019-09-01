@@ -848,22 +848,15 @@ namespace integrator
 
             if (!tree->isLeaf())
             {
-                auto left_result = traverse(tree->child[0].get(), x);
-                if (left_result == nullptr)
+                const int axis = tree->split_axis;
+                auto med = (tree->bbox.pmin[axis] + tree->bbox.pmax[axis]) / 2;
+                if (x[axis] < med)
                 {
-                    auto right_result = traverse(tree->child[1].get(), x);
-                    if (right_result == nullptr)
-                    {
-                        assert(false);
-                    }
-                    else
-                    {
-                        return right_result;
-                    }
+                    return  traverse(tree->child[0].get(), x);
                 }
                 else
                 {
-                    return left_result;
+                    return  traverse(tree->child[1].get(), x);
                 }
             }
             
@@ -915,6 +908,62 @@ namespace integrator
             }
 
             return pdf;
+        }
+
+        Pt sample2(Rng& rng, const integrator::guiding::QuadTree* tree)
+        {
+            const auto* current = tree;
+            float pdf = 1;
+
+            for (;;)
+            {
+                if (!current->isLeaf())
+                {
+                    float p00 = current->child[0]->prob;
+                    float p01 = current->child[1]->prob;
+                    float p10 = current->child[2]->prob;
+                    float p11 = current->child[3]->prob;
+                    const auto sum = p00 + p01 + p10 + p11;
+
+                    float P00 = p00 / sum;
+                    float P01 = p01 / sum;
+                    float P10 = p10 / sum;
+                    float P11 = p11 / sum;
+
+                    const auto u = rng.next01();
+                    int index = 0;
+                    if (u < P00)
+                    {
+                        index = 0;
+                    }
+                    else if (u < P00 + P01)
+                    {
+                        index = 1;
+                    }
+                    else if (u < P00 + P01 + P10)
+                    {
+                        index = 2;
+                    }
+                    else
+                    {
+                        index = 3;
+                    }
+
+                    pdf = pdf * 4.0f * current->child[index]->prob / sum;
+                    current = current->child[index];
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            Pt pt;
+            pt.p[0] = rng.next01() * (current->pmax[0] - current->pmin[0]) + current->pmin[0];
+            pt.p[1] = rng.next01() * (current->pmax[1] - current->pmin[1]) + current->pmin[1];
+            pt.pdf = pdf;
+            
+            return pt;
         }
 
         void sample(const integrator::guiding::QuadTree* tree, Pt* pt, size_t NUM)
@@ -1092,6 +1141,7 @@ namespace integrator
         initial_dir = normalize(initial_pos - camera_position);
     }
 
+//#define PATHTRACING
     // ここに素晴らしいintegratorを書く
     Float3 get_radiance(const integrator::guiding::Param& p, int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
     {
@@ -1125,6 +1175,7 @@ namespace integrator
         guiding::Vertex vertex_list[MAX_DEPTH];
         Float3 weight[MAX_DEPTH];
         Float3 final_emission;
+        guiding::BinaryTree* item_list[MAX_DEPTH];
 
         int depth;
         for (depth = 0; depth < MAX_DEPTH; ++depth)
@@ -1149,15 +1200,21 @@ namespace integrator
             auto& triangle = mesh::oldlib::triangles[info.id];
             auto& material = *triangle.mat;
 
+            auto* item = guiding::traverse(&global_binary_tree, info.pos);
+            item_list[depth + 1] = item;
+
             if (material.ior == 0)
             {
-                auto* item = guiding::traverse(&global_binary_tree, info.pos);
                 float Prr = 0;
 
                 if (loop == 1 || !item)
                     Prr = 1;
                 else
                     Prr = 0.5; // TODO: 改良の余地あり
+
+#ifdef PATHTRACING
+                Prr = 1;
+#endif
 
                 if (rng.next01() <= Prr)
                 {
@@ -1168,14 +1225,15 @@ namespace integrator
                     // 次の方向サンプリング
                     auto next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
                     const float pdf_omega = dot(info.normal, next_dir) / M_PI;
-
                     float MISWeight = 1;
+#ifndef PATHTRACING
                     if (Prr != 1)
                     {
                         float pdf_guiding = guiding::pdf_tree(next_dir, &item->quad_tree);
                         float pdf_bsdf = pdf_omega;
                         MISWeight = (1 / Prr) * (pdf_bsdf / (pdf_bsdf + pdf_guiding));
                     }
+#endif
 
                     ray.dir = next_dir;
                     L += product(throughput, material.emission);
@@ -1185,10 +1243,12 @@ namespace integrator
                 else
                 {
                     // 次の方向サンプリング
-                    guiding::Pt pt;
-                    pt.p[0] = rng.next01();
-                    pt.p[1] = rng.next01();
-                    guiding::sample(&item->quad_tree, &pt, 1);
+                    //guiding::Pt pt;
+                    //pt.p[0] = rng.next01();
+                    //pt.p[1] = rng.next01();
+                    //guiding::sample(&item->quad_tree, &pt, 1);
+
+                    auto pt = guiding::sample2(rng, &item->quad_tree);
 
                     const float pdf_omega = pt.pdf / (4.0f * M_PI);
 
@@ -1302,11 +1362,10 @@ namespace integrator
                     vertex_list[i].dir += p.dir_jitter_radius * sample_uniform_inside_sphere<float, hmath::Float3>(rng);
                     vertex_list[i].dir = normalize(vertex_list[i].dir);
 
-                    auto* item = guiding::traverse(&global_binary_tree, vertex_list[i].pos);
+                    //auto* item = guiding::traverse(&global_binary_tree, vertex_list[i].pos);
+                    auto* item = item_list[i];
                     if (item)
                     {
-                        // ++item->num_sample;
-                        // item->samples.push_back(vertex_list[i]);
                         ++item->num_sample_table[thread_id];
                         guiding::populate(thread_id, vertex_list[i].pos, vertex_list[i].dir, vertex_list[i].radiance / total_sample, &item->quad_tree);
                     }
