@@ -262,6 +262,18 @@ namespace
 
         return Vec3(tx, ty, tz);
     }
+
+    template <typename real, typename Vec3, typename rng>
+    Vec3 sample_uniform_inside_sphere(rng& rng)
+    {
+        const auto u = 2 * rng.next01() - 1;
+        const auto phi = 2 * M_PI * rng.next01();
+        const auto r = pow(rng.next01(), 1 / 3.0f);
+        const auto z = r * u;
+        const auto x = r * cos(phi) * sqrt(1 - z * z);
+        const auto y = r * sin(phi) * sqrt(1 - z * z);
+        return Vec3(x, y, z);
+    }
 }
 
 static std::uniform_real_distribution<> dist01(0.0, 1.0);
@@ -378,6 +390,9 @@ namespace integrator
             float c;
             float k;
             float rho;
+
+            float space_jitter_radius;
+            float dir_jitter_radius;
         };
 
         struct Vertex
@@ -1078,7 +1093,7 @@ namespace integrator
     }
 
     // ここに素晴らしいintegratorを書く
-    Float3 get_radiance(int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
+    Float3 get_radiance(const integrator::guiding::Param& p, int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
     {
 
         const float current_time = rng.next01();
@@ -1282,6 +1297,11 @@ namespace integrator
                 // i = 0はカメラ原点なので無視
                 for (int i = 1; i < num; ++i)
                 {
+                    // jitter
+                    vertex_list[i].pos += p.space_jitter_radius * sample_uniform_inside_sphere<float, hmath::Float3>(rng);
+                    vertex_list[i].dir += p.dir_jitter_radius * sample_uniform_inside_sphere<float, hmath::Float3>(rng);
+                    vertex_list[i].dir = normalize(vertex_list[i].dir);
+
                     auto* item = guiding::traverse(&global_binary_tree, vertex_list[i].pos);
                     if (item)
                     {
@@ -1289,8 +1309,6 @@ namespace integrator
                         // item->samples.push_back(vertex_list[i]);
                         ++item->num_sample_table[thread_id];
                         guiding::populate(thread_id, vertex_list[i].pos, vertex_list[i].dir, vertex_list[i].radiance / total_sample, &item->quad_tree);
-
-                        //item->quad_tree.flux += vertex_list[i].radiance / total_sample;
                     }
                 }
             }
@@ -1552,7 +1570,14 @@ int main(int argc, char** argv)
         integrator::global_binary_tree.bbox = hrt::BBox(
             hmath::Float3(-50, -10, -50),
             hmath::Float3(50,  50, 50));
+    
     }
+
+    integrator::guiding::Param p;
+    p.c = 120; // TODO: ハイパラ
+    p.rho = 0.01f;
+    p.space_jitter_radius = 0.1f;
+    p.dir_jitter_radius = 0.1f;
 
     constexpr int LOOP = 16;
 
@@ -1564,6 +1589,8 @@ int main(int argc, char** argv)
     int image_index = 0;
     for (int loop = 1; loop <= 16; ++loop)
     {
+        p.k = loop;
+
         image[loop] = FloatImage(Width, Height);
         const int num_sample = 1 << loop;
 
@@ -1585,7 +1612,7 @@ int main(int argc, char** argv)
                 {
                     hmath::Float3 pos, dir;
                     integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
-                    auto ret = integrator::get_radiance(tid, rng, pos, dir, loop, num_sample, Width, Height, ix, iy, current_seed);
+                    auto ret = integrator::get_radiance(p, tid, rng, pos, dir, loop, num_sample, Width, Height, ix, iy, current_seed);
 
                     if (is_valid(ret)) {
                         const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
@@ -1774,10 +1801,6 @@ int main(int argc, char** argv)
         // refine guiding
         {
             printf("BEGIN refine\n");
-            integrator::guiding::Param p;
-            p.c = 120; // TODO: ハイパラ
-            p.k = loop;
-            p.rho = 0.01f;
 
             integrator::guiding::merge_binary_tree(&integrator::global_binary_tree);
             integrator::guiding::refine_quad_tree(p, &integrator::global_binary_tree);
