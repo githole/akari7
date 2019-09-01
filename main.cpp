@@ -34,10 +34,15 @@ class FloatImage
 private:
     size_t width_, height_;
     std::vector<hmath::Double3> data_;
-    std::vector<hmath::Double3> data2_;
+//    std::vector<hmath::Double3> data2_;
     std::vector<uint32_t> sample_map_;
+
+    std::vector<hmath::Double3> mean_var_;
 public:
-    FloatImage(size_t w, size_t h) : width_(w), height_(h), data_(width_ * height_), data2_(width_ * height_), sample_map_(width_ * height_)
+    FloatImage(size_t w = 0, size_t h = 0) : width_(w), height_(h), data_(width_ * height_),
+//        data2_(width_ * height_),
+        sample_map_(width_ * height_),
+        mean_var_(width_ * height_)
     {
     }
 
@@ -48,10 +53,15 @@ public:
     {
         return data_[x + y * width_];
     }
-
+#if 0
     hmath::Double3& data2(int x, int y)
     {
         return data2_[x + y * width_];
+    }
+#endif
+    hmath::Double3& mean_var(int x, int y)
+    {
+        return mean_var_[x + y * width_];
     }
 
     uint32_t& samples(int x, int y)
@@ -140,6 +150,7 @@ namespace mesh
 namespace
 {
     const hmath::Float3 rgb2y(0.2126, 0.7152, 0.0722);
+    const hmath::Double3 double_rgb2y(0.2126, 0.7152, 0.0722);
 }
 
 void save_image(const char* filename, FloatImage& image, bool enable_filter = false)
@@ -746,15 +757,34 @@ namespace integrator
             }
         }
 
-        Rng global_rng;
+        // Rng global_rng;
 
-        void refine_binary_tree(const Param& p, BinaryTree* tree)
+        void refine_binary_tree(const Param& p, BinaryTree* tree, int depth = 0)
         {
+            auto next = [&]() {
+                if (depth < 5)
+                {
+                    std::thread th0([&]() {
+                        refine_binary_tree(p, tree->child[0].get(), depth + 1);
+                    });
+                    std::thread th1([&]() {
+                        refine_binary_tree(p, tree->child[1].get(), depth + 1);
+                    });
+
+                    th0.join();
+                    th1.join();
+                }
+                else
+                {
+                    refine_binary_tree(p, tree->child[0].get(), depth + 1);
+                    refine_binary_tree(p, tree->child[1].get(), depth + 1);
+                }
+            };
+
             if (!tree->isLeaf())
             {
                 // íÜä‘node
-                refine_binary_tree(p, tree->child[0].get());
-                refine_binary_tree(p, tree->child[1].get());
+                next();
             }
             else
             {
@@ -779,17 +809,17 @@ namespace integrator
                         tree->child[c]->split_axis = (split_axis + 1) % 3;
                         tree->child[c]->bbox = child_bbox[c];
                         tree->child[c]->num_sample_total = tree->num_sample_total / 2;
+#if 0
                         tree->child[c]->debug_color = Float3(
                             global_rng.next01(), 
                             global_rng.next01(), 
                             global_rng.next01());
+#endif
 
                         tree->child[c]->quad_tree = guiding::copy(&tree->quad_tree);
                     }
                     tree->quad_tree = {};
-
-                    refine_binary_tree(p, tree->child[0].get());
-                    refine_binary_tree(p, tree->child[1].get());
+                    next();
                 }
             }
         }
@@ -880,30 +910,16 @@ namespace integrator
                 const auto* current = tree;
                 pt[i].pdf = 1;
 
-                // continue;
-
-                for (int depth = 0; ;++depth)
+                for (;;)
                 {
                     float pmin[2] = { current->pmin[0], current->pmin[1] };
                     float pmax[2] = { current->pmax[0], current->pmax[1] };
-
-                    if (depth > 100)
-                    {
-                        printf("[%d]\n", depth);
-                        printf("[%f, %f]", pt[i].p[0], pt[i].p[1]);
-                    }
-
                     if (!current->isLeaf())
                     {
                         float p00 = current->child[0]->prob;
                         float p01 = current->child[1]->prob;
                         float p10 = current->child[2]->prob;
                         float p11 = current->child[3]->prob;
-
-                        if (p00 == 0 || p01 == 0 || p10 == 0 || p11 == 0)
-                        {
-                            printf("***");
-                        }
 
                         // è„â∫warp
                         const auto sum = p00 + p01 + p10 + p11;
@@ -919,10 +935,6 @@ namespace integrator
                         int inside_left = 0;
 
                         float left, right;
-
-                        float prev_cpt[2] = {
-                            cpt[0], cpt[1]
-                        };
 
                         if (pmin[1] <= cpt[1] && cpt[1] <= threshold)
                         {
@@ -1494,7 +1506,6 @@ int main(int argc, char** argv)
     const int Width = 1920 / 2;
     const int Height = 1080 / 2;
 
-    FloatImage image(Width, Height);
     bool end_flag = false;
 
     // ÉÅÉbÉVÉÖì«Ç›çûÇ›
@@ -1543,11 +1554,17 @@ int main(int argc, char** argv)
             hmath::Float3(50,  50, 50));
     }
 
+    constexpr int LOOP = 16;
+
+    FloatImage result_image(Width, Height);
+    FloatImage image[LOOP];
+    double image_weight[LOOP];
+
     char buf[256];
     int image_index = 0;
     for (int loop = 1; loop <= 16; ++loop)
     {
-        image = FloatImage(Width, Height);
+        image[loop] = FloatImage(Width, Height);
         const int num_sample = 1 << loop;
 
         printf("loop: %d\n", loop);
@@ -1572,20 +1589,64 @@ int main(int argc, char** argv)
 
                     if (is_valid(ret)) {
                         const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
-                        //p += dret;
 
                         // ï™éUåvéZóp
-                        //const auto lumi = dot(dret, rgb2y);
-                        //vp[0] += lumi * lumi;
+                        const auto lumi = dot(dret, double_rgb2y);
+                        image[loop].mean_var(ix, iy)[0] += lumi;
+                        image[loop].mean_var(ix, iy)[1] += lumi * lumi;
 
-                        //current_work->image->samples(ix, iy) += 1;
-
-                        image(ix, iy) += dret;
-                        image.samples(ix, iy) += 1;
+                        image[loop](ix, iy) += dret;
+                        image[loop].samples(ix, iy) += 1;
                     }
                 }
             }
         }
+
+        // image varÇåvéZ
+        double weight = 0;
+        for (int iy = 0; iy < Height; ++iy)
+        {
+            for (int ix = 0; ix < Width; ++ix)
+            {
+                const double samples = image[loop].samples(ix, iy);
+                const double lumi2 = image[loop].mean_var(ix, iy)[1];
+                const double lumi = image[loop].mean_var(ix, iy)[0];
+                const double X = lumi2 / samples;
+                const double Y = pow(lumi / samples, 2);
+                const double var = X - Y;
+                weight += 1 / std::max(1e-64, var);
+            }
+        }
+        image_weight[loop] = weight;
+
+        double image_weight_sum = 0;
+        for (int i = 1; i <= loop; ++i)
+        {
+            image_weight_sum += image_weight[i];
+        }
+
+        // èdÇ›ïtÇ´òaÇåvéZ
+#pragma omp parallel for schedule(dynamic)
+        for (int iy = 0; iy < Height; ++iy)
+        {
+            for (int ix = 0; ix < Width; ++ix)
+            {
+
+                hmath::Double3 col;
+                for (int i = 1; i <= loop; ++i)
+                {
+                    col = col + (image_weight[i] / image_weight_sum) * image[loop](ix, iy) / (double)image[loop].samples(ix, iy);
+                }
+                result_image(ix, iy) = col;
+                result_image.samples(ix, iy) = 1;
+            }
+        }
+
+        for (int i = 1; i <= loop; ++i)
+        {
+            printf("[%f]", (image_weight[i] / image_weight_sum));
+        }
+        printf("\n");
 
         // debug
         if (0)
@@ -1619,7 +1680,7 @@ int main(int argc, char** argv)
                 {
                     if (tree)
                     {
-                        image.samples(ix, iy) = 1;
+                        image[loop].samples(ix, iy) = 1;
 
                         //image(ix, iy) = tree->debug_color;
                         //image(ix, iy) = hmath::Float3(tree->quad_tree.flux / 10 / num_sample, 0, 0);
@@ -1642,9 +1703,9 @@ int main(int argc, char** argv)
                         };
 
                         if (depth >= 6)
-                            image(ix, iy) = hmath::Float3(0.1, 0.1, 0.1);
+                            image[loop](ix, iy) = hmath::Float3(0.1, 0.1, 0.1);
                         else
-                            image(ix, iy) = tbl[depth];
+                            image[loop](ix, iy) = tbl[depth];
 
 #endif
                     }
@@ -1729,7 +1790,8 @@ int main(int argc, char** argv)
         // save
         {
             sprintf(buf, "%03d.png", image_index);
-            save_image(buf, image);
+//            save_image(buf, image[loop]);
+            save_image(buf, result_image);
             std::cout << "Saved: " << buf << std::endl;
             ++image_index;
         }
