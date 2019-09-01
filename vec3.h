@@ -108,6 +108,16 @@ namespace hmath
     }
 
     template<typename Real>
+    Vec3<Real> operator/(const Vec3<Real>& v, const Vec3<Real>& v2)
+    {
+        Vec3<Real> t;
+        t[0] = v[0] / v2[0];
+        t[1] = v[1] / v2[1];
+        t[2] = v[2] / v2[2];
+        return t;
+    }
+
+    template<typename Real>
     Vec3<Real> operator*(Real scalar, const Vec3<Real>& v)
     {
         auto t{ v };

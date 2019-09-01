@@ -20,8 +20,14 @@
 #include <vector>
 #include <atomic>
 #include <random>
+#include <omp.h>
+
+#define _USE_MATH_DEFINES
+#include <math.h>
 
 // #define TEST
+
+constexpr int NUM_THREAD = 72;
 
 class FloatImage
 {
@@ -75,7 +81,7 @@ namespace mesh
         // TODO: 外部からなんとかできるようにしたいところではある
         material_table.clear();
         material_table.push_back({ hmath::Float3(0.18f, 0.18f, 0.18f), hmath::Float3(0, 0, 0) });
-        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(160, 80, 20) });
+        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(160, 80, 20) / 64.0f });
         material_table.push_back({ hmath::Float3(1.0f, 1.0f, 1.0f), hmath::Float3(0, 0, 0), 1.5f });
 
         std::vector<uint32_t> material_map;
@@ -133,7 +139,7 @@ namespace mesh
 
 namespace
 {
-    const hmath::Double3 rgb2y(0.2126, 0.7152, 0.0722);
+    const hmath::Float3 rgb2y(0.2126, 0.7152, 0.0722);
 }
 
 void save_image(const char* filename, FloatImage& image, bool enable_filter = false)
@@ -202,9 +208,22 @@ void save_image(const char* filename, FloatImage& image, bool enable_filter = fa
     std::cout << "Average: " << average << " samples/pixel" << std::endl;
     stbi_write_png(filename, (int)Width, (int)Height, 3, uint8_tonemapped_image.data(), (int)(Width * sizeof(uint8_t) * 3));
 
-    // hhdr::save("hoge.hdr", fdata.data(), (int)Width, (int)Height, false);
+    std::string hdrfilename = filename;
+    hhdr::save((hdrfilename + +".hdr").c_str(), fdata.data(), (int)Width, (int)Height, false);
 }
 
+
+namespace
+{
+
+    template<typename V, typename T>
+    inline void directionToPolarCoordinate(const V& dir, T *theta, T *phi) {
+        *theta = acos(dir[1]);
+        *phi = atan2(dir[2], dir[0]);
+        if (*phi < 0)
+            *phi += 2.0f * M_PI;
+    }
+}
 
 namespace integrator
 {
@@ -312,21 +331,434 @@ namespace integrator
 
     static std::uniform_real_distribution<> dist01(0.0, 1.0);
 
-    // ここに素晴らしいintegratorを書く
-    Float3 get_radiance(int w, int h, int x, int y, uint64_t seed)
+    namespace guiding
     {
-        Rng rng;
-        rng.set_seed(seed);
+        struct Param
+        {
+            float c;
+            float k;
+            float rho;
+        };
 
-        const float current_time = rng.next01();
+        struct Vertex
+        {
+            Float3 pos;
+            Float3 dir;
+            float radiance = 0;
+        };
 
+        // QuadTree
+        // [0, 1) x [0, 1)
+        struct QuadTree
+        {
+            // 全部nullならleaf
+            // std::unique_ptr<QuadTree> child[4] = {};
+            QuadTree* child[4] = {};
+            bool isLeaf() const
+            {
+                return !child[0] && !child[1] && !child[2] && !child[3];
+            }
+
+            float flux_tmp[NUM_THREAD] = {};
+            float flux_total = 0;
+
+            // float flux = 0;
+            float pmin[2] = {0, 0};
+            float pmax[2] = {1, 1};
+
+            bool inside(float u, float v) const
+            {
+                return
+                    pmin[0] <= u && u <= pmax[0] &&
+                    pmin[1] <= v && v <= pmax[1];
+            }
+
+            void deallocate()
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    if (child[c])
+                    {
+                        child[c]->deallocate();
+                        delete child[c];
+                        child[c] = nullptr;
+                    }
+                }
+            }
+
+            QuadTree() = default;
+
+            // copy禁止
+            QuadTree(const QuadTree& tree) = delete;
+            QuadTree& operator=(const QuadTree& tree) = delete;
+
+            QuadTree& operator=(QuadTree&& tree)
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    this->child[c] = tree.child[c];
+                    this->flux_total = tree.flux_total;
+                    std::copy(tree.flux_tmp, tree.flux_tmp + NUM_THREAD, this->flux_tmp);
+                    this->pmin[0] = tree.pmin[0];
+                    this->pmax[0] = tree.pmax[0];
+                    this->pmin[1] = tree.pmin[1];
+                    this->pmax[1] = tree.pmax[1];
+                    tree.child[c] = nullptr;
+                }
+                return *this;
+            }
+
+            QuadTree(QuadTree&& tree)
+            {
+                *this = std::move(tree);
+            }
+
+            ~QuadTree()
+            {
+                deallocate();
+            }
+        };
+
+        void reset(QuadTree* tree)
+        {
+            if (tree == nullptr)
+                return;
+
+            tree->flux_total = 0;
+            std::fill(tree->flux_tmp, tree->flux_tmp + NUM_THREAD, 0);
+            for (int c = 0; c < 4; ++c)
+            {
+                reset(tree->child[c]);
+            }
+        }
+
+        int calc_depth(float u, float v, QuadTree* tree, int depth = 0)
+        {
+            if (!tree->isLeaf())
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    if (tree->child[c]->inside(u, v))
+                    {
+                        return calc_depth(u, v, tree->child[c], depth + 1);
+                    }
+                }
+
+            }
+            return depth;
+        }
+
+        void populate(int thread_id, const Float3& pos, const Float3& dir, float radiance, QuadTree* tree)
+        {
+            float theta, phi;
+            directionToPolarCoordinate(dir, &theta, &phi);
+            const float v = theta / M_PI;
+            const float u = phi / (2 * M_PI);
+
+            if (tree->inside(u, v))
+            {
+//                tree->flux += radiance; // TODO: なんかおかしくないか？
+                tree->flux_tmp[thread_id] += radiance;
+                if (!tree->isLeaf())
+                {
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        populate(thread_id, pos, dir, radiance, tree->child[c]);
+                    }
+                }
+            }
+        }
+
+        QuadTree copy(const QuadTree* tree)
+        {
+            QuadTree copy_tree;
+
+            copy_tree.flux_total = tree->flux_total;
+            std::copy(tree->flux_tmp, tree->flux_tmp + NUM_THREAD, copy_tree.flux_tmp);
+
+            copy_tree.pmin[0] = tree->pmin[0];
+            copy_tree.pmin[1] = tree->pmin[1];
+            copy_tree.pmax[0] = tree->pmax[0];
+            copy_tree.pmax[1] = tree->pmax[1];
+
+            if (!tree->isLeaf())
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    copy_tree.child[c] = new QuadTree();
+                    *copy_tree.child[c] = copy(tree->child[c]);
+                }
+            }
+
+            return copy_tree;
+        }
+
+        void refine_quad_tree_sub(const Param& p, const float total_flux, QuadTree* tree)
+        {
+            if (total_flux == 0)
+                return;
+
+            const auto current_flux = tree->flux_total;
+
+            if (tree->isLeaf())
+            {
+                if (tree->flux_total / total_flux > p.rho)
+                {
+                    // subdivide
+                    const float mid[2] = {
+                        (tree->pmin[0] + tree->pmax[0]) / 2,
+                        (tree->pmin[1] + tree->pmax[1]) / 2,
+                    };
+
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        // tree->child[c] = std::unique_ptr<QuadTree>(new QuadTree());
+                        tree->child[c] = new QuadTree();
+                        tree->child[c]->flux_total = tree->flux_total / 4;
+                    }
+
+                    tree->child[0]->pmin[0] = tree->pmin[0];
+                    tree->child[0]->pmin[1] = tree->pmin[1];
+                    tree->child[0]->pmax[0] = mid[0];
+                    tree->child[0]->pmax[1] = mid[1];
+
+                    tree->child[1]->pmin[0] = mid[0];
+                    tree->child[1]->pmin[1] = tree->pmin[1];
+                    tree->child[1]->pmax[0] = tree->pmax[0];
+                    tree->child[1]->pmax[1] = mid[1];
+
+                    tree->child[2]->pmin[0] = tree->pmin[0];
+                    tree->child[2]->pmin[1] = mid[1];
+                    tree->child[2]->pmax[0] = mid[0];
+                    tree->child[2]->pmax[1] = tree->pmax[1];
+
+                    tree->child[3]->pmin[0] = mid[0];
+                    tree->child[3]->pmin[1] = mid[1];
+                    tree->child[3]->pmax[0] = tree->pmax[0];
+                    tree->child[3]->pmax[1] = tree->pmax[1];
+
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        refine_quad_tree_sub(p, total_flux, tree->child[c]);
+                    }
+                }
+                return;
+            }
+
+            // node
+#if 1
+            if (tree->flux_total / total_flux < p.rho)
+            {
+                printf("*");
+                // まとめる
+                for (int c = 0; c < 4; ++c)
+                {
+                    tree->child[c] = nullptr;
+                }
+                return;
+            }
+#endif
+
+            for (int c = 0; c < 4; ++c)
+            {
+                refine_quad_tree_sub(p, total_flux, tree->child[c]);
+            }
+        }
+
+        // 空間構造
+        struct BinaryTree
+        {
+            // 両方nullならleaf
+            // 中間nodeなら、両方not null
+            std::unique_ptr<BinaryTree> child[2] = {};
+
+            // info
+            int split_axis = 0; // x, y, z
+            hrt::BBox bbox;
+            // uint64_t num_sample = {};
+            uint32_t num_sample_table[NUM_THREAD] = {};
+            uint32_t num_sample_total = 0;
+
+            bool isLeaf() const
+            {
+                return !child[0] && !child[1];
+            }
+
+            // sample
+            // std::vector<Vertex> samples;
+
+            // quad tree
+            QuadTree quad_tree;
+
+            // debug
+            Float3 debug_color;
+        };
+
+        void merge_binary_tree_sub(QuadTree* tree)
+        {
+            if (tree == nullptr)
+                return;
+
+            tree->flux_total = 0;
+            for (int i = 0; i < NUM_THREAD; ++i)
+            {
+                tree->flux_total += tree->flux_tmp[i];
+            }
+
+            for (int c = 0; c < 4; ++c)
+            {
+                merge_binary_tree_sub(tree->child[c]);
+            }
+        }
+
+        void merge_binary_tree(BinaryTree* tree)
+        {
+            if (tree->isLeaf())
+            {
+                merge_binary_tree_sub(&tree->quad_tree);
+
+                tree->num_sample_total = 0;
+                for (int i = 0; i < NUM_THREAD; ++i)
+                {
+                    tree->num_sample_total +=
+                        tree->num_sample_table[i];
+                }
+            }
+
+            if (!tree->isLeaf())
+            {
+                for (int c = 0; c < 2; ++c)
+                {
+                    merge_binary_tree(tree->child[c].get());
+                }
+            }
+        }
+
+        void refine_quad_tree(const Param& p, BinaryTree* tree)
+        {
+            if (!tree->isLeaf())
+            {
+                for (int c = 0; c < 2; ++c)
+                {
+                    refine_quad_tree(p, tree->child[c].get());
+                }
+            }
+            else
+            {
+                refine_quad_tree_sub(p, tree->quad_tree.flux_total, &tree->quad_tree);
+            }
+        }
+
+        void reset(BinaryTree* tree)
+        {
+            // tree->num_sample = 0;
+            // tree->samples.clear();
+            tree->num_sample_total = 0;
+            std::fill(tree->num_sample_table, tree->num_sample_table + NUM_THREAD, 0);
+            reset(&tree->quad_tree);
+
+            if (!tree->isLeaf())
+            {
+                for (int c = 0; c < 2; ++c)
+                {
+                    reset(tree->child[c].get());
+                }
+            }
+        }
+
+        Rng global_rng;
+
+        void refine_binary_tree(const Param& p, BinaryTree* tree)
+        {
+            if (!tree->isLeaf())
+            {
+                // 中間node
+                refine_binary_tree(p, tree->child[0].get());
+                refine_binary_tree(p, tree->child[1].get());
+            }
+            else
+            {
+                // leaf
+                if (tree->num_sample_total > p.c * sqrt(pow(2.0f, p.k)))
+                {
+                    // subdivide
+                    const auto split_axis = tree->split_axis;
+
+                    hrt::BBox child_bbox[2];
+
+                    auto mid = (tree->bbox.pmax[split_axis] + tree->bbox.pmin[split_axis]) / 2;
+
+                    child_bbox[0] = tree->bbox;
+                    child_bbox[1] = tree->bbox;
+                    child_bbox[0].pmax[split_axis] = mid;
+                    child_bbox[1].pmin[split_axis] = mid;
+
+                    for (int c = 0; c < 2; ++c)
+                    {
+                        tree->child[c] = std::unique_ptr<BinaryTree>(new BinaryTree());
+                        tree->child[c]->split_axis = (split_axis + 1) % 3;
+                        tree->child[c]->bbox = child_bbox[c];
+                        tree->child[c]->num_sample_total = tree->num_sample_total / 2;
+                        tree->child[c]->debug_color = Float3(
+                            global_rng.next01(), 
+                            global_rng.next01(), 
+                            global_rng.next01());
+
+                        tree->child[c]->quad_tree = guiding::copy(&tree->quad_tree);
+                    }
+                    tree->quad_tree = {};
+
+                    refine_binary_tree(p, tree->child[0].get());
+                    refine_binary_tree(p, tree->child[1].get());
+                }
+            }
+        }
+
+        BinaryTree* traverse(BinaryTree* tree, const Float3& x)
+        {
+            if (!tree->bbox.inside(x))
+            {
+                return nullptr;
+            }
+
+            if (!tree->isLeaf())
+            {
+                auto left_result = traverse(tree->child[0].get(), x);
+                if (left_result == nullptr)
+                {
+                    auto right_result = traverse(tree->child[1].get(), x);
+                    if (right_result == nullptr)
+                    {
+                        assert(false);
+                    }
+                    else
+                    {
+                        return right_result;
+                    }
+                }
+                else
+                {
+                    return left_result;
+                }
+            }
+            
+            // leaf
+            return tree;
+        }
+    }
+
+    guiding::BinaryTree global_binary_tree;
+    guiding::BinaryTree* debug_tree;
+
+    void get_initial_ray(Rng& rng, int w, int h, int x, int y, Float3& initial_pos, Float3& initial_dir)
+    {
         // カメラデータを直接突っ込む
 #if 0
         Float3 camera_position(15, 9, 10);
         Float3 camera_dir = normalize(Float3(0, 0, 0) - camera_position);
         const float fovy = (90.0f) / 180.0f * hmath::pi<float>();
 #endif
-        Float3 camera_position(34, 15, 32);
+        hmath::Float3 camera_position(34, 15, 32);
         Float3 camera_dir = normalize(Float3(0, 0, 0) - camera_position);
         const float fovy = (45.0f) / 180.0f * hmath::pi<float>();
 
@@ -369,9 +801,27 @@ namespace integrator
 #endif
 #endif
 
-        const auto initial_pos = camera_position + camera_dir * length + new_U * screen_side + new_V * screen_up;
-        const auto initial_dir = normalize(initial_pos - camera_position);
+        initial_pos = camera_position + camera_dir * length + new_U * screen_side + new_V * screen_up;
+        initial_dir = normalize(initial_pos - camera_position);
+    }
 
+    // ここに素晴らしいintegratorを書く
+    Float3 get_radiance(int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int sample, int total_sample, int w, int h, int x, int y)
+    {
+
+        const float current_time = rng.next01();
+
+#if 0
+        // guiding debug
+        if (x == 0 && y == 0 && sample == 0)
+        {
+            integrator::Ray ray;
+            ray.org = initial_pos;
+            ray.dir = initial_dir;
+            auto info = intersect(ray);
+            debug_tree = guiding::traverse(&global_binary_tree, info.pos);
+        }
+#endif
 
         // naive pathtracing
 #if 1
@@ -383,8 +833,17 @@ namespace integrator
 
         bool into = true;
 
-        for (int depth = 0; depth < 5; ++depth)
+        constexpr int MAX_DEPTH = 5;
+
+        // guiding
+        guiding::Vertex vertex_list[MAX_DEPTH];
+        Float3 weight[MAX_DEPTH];
+        Float3 final_emission;
+
+        int depth;
+        for (depth = 0; depth < MAX_DEPTH; ++depth)
         {
+            auto org_ray = ray;
             auto info = intersect(ray);
             if (!info.hit)
             {
@@ -394,6 +853,12 @@ namespace integrator
             }
             ray.org = info.pos;
             ray.id = info.id;
+
+            // guiding
+            {
+                vertex_list[depth].pos = org_ray.org;
+                vertex_list[depth].dir = org_ray.dir;
+            }
 
             auto& triangle = mesh::oldlib::triangles[info.id];
             auto& material = *triangle.mat;
@@ -409,6 +874,21 @@ namespace integrator
                 ray.dir = next_dir;
                 L += product(throughput, material.emission);
                 throughput = product(throughput, material.diffuse);
+
+                // guiding
+                if (depth + 1 < MAX_DEPTH)
+                {
+                    weight[depth + 1] = material.diffuse;
+                }
+
+                auto lumi = dot(rgb2y, material.emission);
+
+                // 光源にhitしたら終了する
+                if (lumi > 0)
+                {
+                    final_emission = material.emission;
+                    break;
+                }
             }
             else
             {
@@ -461,6 +941,38 @@ namespace integrator
 
         }
 
+        // guiding処理
+        if (depth <  MAX_DEPTH)
+        {
+            const auto num = depth;
+            auto lumi = dot(rgb2y, final_emission);
+            if (lumi > 0)
+            {
+                vertex_list[depth].radiance = dot(rgb2y, final_emission);
+
+                for (depth = depth - 1; depth >= 0; --depth)
+                {
+                    vertex_list[depth].radiance =
+                        vertex_list[depth + 1].radiance * dot(rgb2y, weight[depth + 1]);
+                }
+
+                // i = 0はカメラ原点なので無視
+                for (int i = 1; i < num; ++i)
+                {
+                    auto* item = guiding::traverse(&global_binary_tree, vertex_list[i].pos);
+                    if (item)
+                    {
+                        // ++item->num_sample;
+                        // item->samples.push_back(vertex_list[i]);
+                        ++item->num_sample_table[thread_id];
+                        guiding::populate(thread_id, vertex_list[i].pos, vertex_list[i].dir, vertex_list[i].radiance / total_sample, &item->quad_tree);
+
+                        //item->quad_tree.flux += vertex_list[i].radiance / total_sample;
+                    }
+                }
+            }
+        }
+
         return L;
 #endif
 #if 0
@@ -509,16 +1021,28 @@ namespace integrator
 
 int main(int argc, char** argv)
 {
-    const int NUM_THREAD = 72;
+    integrator::guiding::QuadTree tree;
+#if 0
+    tree.flux = 100;
+    integrator::guiding::Param p;
+    p.c = 12000; // TODO: ハイパラ
+    p.rho = 0.1;
+    integrator::guiding::refine_quad_tree(p, 100, &tree);
 
-    const int Width = 1920;
-    const int Height = 1080;
+
+    auto copy_tree = integrator::guiding::copy(&tree);
+
+    return 0;
+#endif
+
+    const int Width = 1920 / 4;
+    const int Height = 1080 / 4;
 
     FloatImage image(Width, Height);
     bool end_flag = false;
 
     // メッシュ読み込み
-    printf("Load nad Build.\n");
+    printf("Load and Build.\n");
 //    auto mesh = mesh::loadMesh("head.obj");
     auto mesh = mesh::loadMesh("C:/Code/VSProjects/pathological_mesher/pathological_mesher/rtcamp.obj");
     {
@@ -556,6 +1080,145 @@ int main(int argc, char** argv)
     }
     printf("Build BVH End.\n");
 
+    // setup
+    {
+        integrator::global_binary_tree.bbox = hrt::BBox(
+            hmath::Float3(-50, -10, -50),
+            hmath::Float3(50,  50, 50));
+    }
+
+    char buf[256];
+    int image_index = 0;
+    for (int loop = 1; loop <= 16; ++loop)
+    {
+        const int num_sample = 1 << loop;
+
+        printf("loop: %d\n", loop);
+        
+#pragma omp parallel for schedule(dynamic)
+        for (int iy = 0; iy < Height; ++iy)
+        {
+            const int tid = omp_get_thread_num();
+
+            for (int ix = 0; ix < Width; ++ix)
+            {
+                const int current_seed = (ix + iy * 8192) * 8192 + loop;
+
+                for (int s = 0; s < num_sample; ++s)
+                {
+                    hmath::Rng rng;
+                    rng.set_seed(current_seed);
+
+                    hmath::Float3 pos, dir;
+                    integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
+                    auto ret = integrator::get_radiance(tid, rng, pos, dir, num_sample, Width, Height, ix, iy, current_seed);
+
+                    if (is_valid(ret)) {
+                        const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
+                        //p += dret;
+
+                        // 分散計算用
+                        //const auto lumi = dot(dret, rgb2y);
+                        //vp[0] += lumi * lumi;
+
+                        //current_work->image->samples(ix, iy) += 1;
+
+                        image(ix, iy) += dret;
+                        image.samples(ix, iy) += 1;
+                    }
+                }
+            }
+        }
+
+        // debug
+        {
+            
+            for (int iy = 0; iy < Height; ++iy)
+            {
+                for (int ix = 0; ix < Width; ++ix)
+                {
+                    {
+                        hmath::Rng rng;
+                        rng.set_seed(0);
+
+                        hmath::Float3 pos, dir;
+                        integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
+
+                        // debug
+                        {
+                            integrator::Ray ray;
+                            ray.org = pos;
+                            ray.dir = dir;
+                            auto info = intersect(ray);
+                            auto* tree = integrator::guiding::traverse(&integrator::global_binary_tree, info.pos);
+
+                            if (tree)
+                            {
+                                image.samples(ix, iy) = 1;
+
+                                //image(ix, iy) = tree->debug_color;
+                                //image(ix, iy) = hmath::Float3(tree->quad_tree.flux / 10 / num_sample, 0, 0);
+                                
+#if 1
+                                auto& aabb = tree->bbox;
+
+                                const auto d = (info.pos - aabb.pmin) / (aabb.pmax - aabb.pmin);
+                                const float u = d[0];
+                                const float v = d[2];
+
+                                auto depth = integrator::guiding::calc_depth(u, v, &tree->quad_tree);
+
+
+                                hmath::Float3 tbl[] = {
+                                    hmath::Float3(1, 0, 0),
+                                    hmath::Float3(0, 1, 0),
+                                    hmath::Float3(0, 0, 1),
+                                    hmath::Float3(1, 1, 0),
+                                    hmath::Float3(0, 1, 1),
+                                    hmath::Float3(1, 1, 1),
+                                };
+
+                                if (depth >= 6)
+                                    image(ix, iy) = hmath::Float3(0.1, 0.1, 0.1);
+                                else
+                                    image(ix, iy) = tbl[depth];
+
+#endif
+                            }
+                        }
+
+                    }
+                }
+            }
+        }
+
+        // refine guiding
+        {
+            printf("BEGIN refine\n");
+            integrator::guiding::Param p;
+            p.c = 1200; // TODO: ハイパラ
+            p.k = loop;
+            p.rho = 0.1f;
+
+            integrator::guiding::merge_binary_tree(&integrator::global_binary_tree);
+            integrator::guiding::refine_quad_tree(p, &integrator::global_binary_tree);
+            integrator::guiding::refine_binary_tree(p, &integrator::global_binary_tree);
+            integrator::guiding::reset(&integrator::global_binary_tree);
+            printf("END refine\n");
+        }
+
+        // save
+        {
+            sprintf(buf, "%03d.png", image_index);
+            save_image(buf, image);
+            std::cout << "Saved: " << buf << std::endl;
+            ++image_index;
+        }
+    }
+
+
+
+#if 0
     // 時間監視スレッドを立てる
     std::thread watcher([&end_flag, &image]() {
         int image_index = 0;
@@ -709,6 +1372,7 @@ int main(int argc, char** argv)
     }
 
     watcher.join();
+#endif
 
     return 0;
 }
