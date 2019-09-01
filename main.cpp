@@ -81,7 +81,7 @@ namespace mesh
         // TODO: 外部からなんとかできるようにしたいところではある
         material_table.clear();
         material_table.push_back({ hmath::Float3(0.18f, 0.18f, 0.18f), hmath::Float3(0, 0, 0) });
-        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(160, 80, 20) / 64.0f });
+        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(160, 80, 20) / 64.0f * 64.0f });
         material_table.push_back({ hmath::Float3(1.0f, 1.0f, 1.0f), hmath::Float3(0, 0, 0), 1.5f });
 
         std::vector<uint32_t> material_map;
@@ -223,7 +223,37 @@ namespace
         if (*phi < 0)
             *phi += 2.0f * M_PI;
     }
+
+    template <typename Vec3, typename T>
+    inline Vec3 polarCoordinateToDirection(T theta, T phi, const Vec3 &normal,
+        const Vec3 &tangent,
+        const Vec3 &binormal) {
+        return
+            sin(theta) * cos(phi) * tangent + 
+            cos(theta) * normal +
+            sin(theta) * sin(phi) * binormal;
+    }
+
+    // Y-up
+    template <typename Vec3, typename T>
+    inline Vec3 polarCoordinateToDirectionWorldSpace(T theta, T phi)
+    {
+        return Vec3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+    }
+
+    template <typename real, typename Vec3, typename rng>
+    Vec3 sample_uniform_sphere_surface(rng &rng) {
+        const real tz = rng.next01() * 2 - 1;
+        const real phi = rng.next01() * M_PI * 2;
+        const real k = sqrt(1.0 - tz * tz);
+        const real tx = k * cos(phi);
+        const real ty = k * sin(phi);
+
+        return Vec3(tx, ty, tz);
+    }
 }
+
+static std::uniform_real_distribution<> dist01(0.0, 1.0);
 
 namespace integrator
 {
@@ -329,7 +359,6 @@ namespace integrator
         return tz * normal + tx * tangent + ty * binormal;
     }
 
-    static std::uniform_real_distribution<> dist01(0.0, 1.0);
 
     namespace guiding
     {
@@ -361,6 +390,7 @@ namespace integrator
 
             float flux_tmp[NUM_THREAD] = {};
             float flux_total = 0;
+            float prob = 0;
 
             // float flux = 0;
             float pmin[2] = {0, 0};
@@ -398,6 +428,7 @@ namespace integrator
                 {
                     this->child[c] = tree.child[c];
                     this->flux_total = tree.flux_total;
+                    this->prob = tree.prob;
                     std::copy(tree.flux_tmp, tree.flux_tmp + NUM_THREAD, this->flux_tmp);
                     this->pmin[0] = tree.pmin[0];
                     this->pmax[0] = tree.pmax[0];
@@ -419,11 +450,29 @@ namespace integrator
             }
         };
 
+        float update_prob(QuadTree* tree, float prob = 0.25f)
+        {
+            if (!tree->isLeaf())
+            {
+                float sum = 0;
+                for (int c = 0; c < 4; ++c)
+                {
+                    sum += update_prob(tree->child[c], prob);
+                }
+                tree->prob = sum;
+                return sum;
+            }
+
+            tree->prob = prob;
+            return prob;
+        }
+
         void reset(QuadTree* tree)
         {
             if (tree == nullptr)
                 return;
 
+            tree->prob = 0;
             tree->flux_total = 0;
             std::fill(tree->flux_tmp, tree->flux_tmp + NUM_THREAD, 0);
             for (int c = 0; c < 4; ++c)
@@ -448,11 +497,26 @@ namespace integrator
             return depth;
         }
 
+        void direct_populate(float value, float u, float v, QuadTree* tree)
+        {
+            if (tree->inside(u, v))
+            {
+                tree->flux_total += value;
+                if (!tree->isLeaf())
+                {
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        direct_populate(value, u, v, tree->child[c]);
+                    }
+                }
+            }
+        }
+
         void populate(int thread_id, const Float3& pos, const Float3& dir, float radiance, QuadTree* tree)
         {
             float theta, phi;
             directionToPolarCoordinate(dir, &theta, &phi);
-            const float v = theta / M_PI;
+            const float v = (cos(theta) + 1) / 2; //theta / M_PI;
             const float u = phi / (2 * M_PI);
 
             if (tree->inside(u, v))
@@ -473,6 +537,7 @@ namespace integrator
         {
             QuadTree copy_tree;
 
+            copy_tree.prob = tree->prob;
             copy_tree.flux_total = tree->flux_total;
             std::copy(tree->flux_tmp, tree->flux_tmp + NUM_THREAD, copy_tree.flux_tmp);
 
@@ -549,7 +614,6 @@ namespace integrator
 #if 1
             if (tree->flux_total / total_flux < p.rho)
             {
-                printf("*");
                 // まとめる
                 for (int c = 0; c < 4; ++c)
                 {
@@ -630,6 +694,22 @@ namespace integrator
                 for (int c = 0; c < 2; ++c)
                 {
                     merge_binary_tree(tree->child[c].get());
+                }
+            }
+        }
+
+        void update_binarytree_prob(BinaryTree* tree)
+        {
+            if (tree->isLeaf())
+            {
+                update_prob(&tree->quad_tree);
+            }
+
+            if (!tree->isLeaf())
+            {
+                for (int c = 0; c < 2; ++c)
+                {
+                    update_binarytree_prob(tree->child[c].get());
                 }
             }
         }
@@ -745,6 +825,186 @@ namespace integrator
             // leaf
             return tree;
         }
+
+
+        struct Pt
+        {
+            float p[2];
+            float pdf;
+        };
+
+        float pdf_tree(const Float3& dir, const integrator::guiding::QuadTree* tree)
+        {
+            float pdf = 1;
+            float theta, phi;
+            directionToPolarCoordinate(dir, &theta, &phi);
+            const float v = (cos(theta) + 1) / 2; //theta / M_PI;
+            const float u = phi / (2 * M_PI);
+
+            const auto* current = tree;
+
+            for (int depth = 0; ;++depth)
+            {
+                if (!current->isLeaf())
+                {
+                    float p00 = current->child[0]->prob;
+                    float p01 = current->child[1]->prob;
+                    float p10 = current->child[2]->prob;
+                    float p11 = current->child[3]->prob;
+                    const auto sum = p00 + p01 + p10 + p11;
+
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        if (current->child[c]->inside(u, v))
+                        {
+                            pdf = pdf * 4.0f * current->child[c]->prob / sum;
+                            current = current->child[c];
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            return pdf;
+        }
+
+        void sample(const integrator::guiding::QuadTree* tree, Pt* pt, size_t NUM)
+        {
+            for (int i = 0; i < NUM; ++i)
+            {
+                auto& cpt = pt[i].p;
+                const auto* current = tree;
+                pt[i].pdf = 1;
+
+                // continue;
+
+                for (int depth = 0; ;++depth)
+                {
+                    float pmin[2] = { current->pmin[0], current->pmin[1] };
+                    float pmax[2] = { current->pmax[0], current->pmax[1] };
+
+                    if (depth > 100)
+                    {
+                        printf("[%d]\n", depth);
+                        printf("[%f, %f]", pt[i].p[0], pt[i].p[1]);
+                    }
+
+                    if (!current->isLeaf())
+                    {
+                        float p00 = current->child[0]->prob;
+                        float p01 = current->child[1]->prob;
+                        float p10 = current->child[2]->prob;
+                        float p11 = current->child[3]->prob;
+
+                        if (p00 == 0 || p01 == 0 || p10 == 0 || p11 == 0)
+                        {
+                            printf("***");
+                        }
+
+                        // 上下warp
+                        const auto sum = p00 + p01 + p10 + p11;
+                        const auto upper = (p00 + p01) / sum;
+                        const auto lower = (p10 + p11) / sum;
+
+                        auto ylen = pmax[1] - pmin[1];
+                        auto upper_len = ylen * upper;
+                        auto lower_len = ylen * lower;
+                        auto threshold = pmin[1] + upper_len;
+
+                        int inside_upper = 0;
+                        int inside_left = 0;
+
+                        float left, right;
+
+                        float prev_cpt[2] = {
+                            cpt[0], cpt[1]
+                        };
+
+                        if (pmin[1] <= cpt[1] && cpt[1] <= threshold)
+                        {
+                            inside_upper = 1;
+
+                            // 上側、min側ともいう（左上原点）
+                            cpt[1] = (cpt[1] - pmin[1]) / upper_len * (ylen / 2) + pmin[1];
+
+                            // 左右warp
+                            const auto sum2 = p00 + p01;
+                            left = p00 / sum2;
+                            right = p01 / sum2;
+                        }
+                        else
+                        {
+                            cpt[1] = (cpt[1] - threshold) / lower_len * (ylen / 2) + (ylen / 2) + pmin[1];
+
+                            // 左右warp
+                            const auto sum2 = p10 + p11;
+                            left = p10 / sum2;
+                            right = p11 / sum2;
+                        }
+
+                        // 左右warp
+                        auto xlen = pmax[0] - pmin[0];
+                        auto left_len = xlen * left;
+                        auto right_len = xlen * right;
+                        auto threshold2 = pmin[0] + left_len;
+
+                        if (pmin[0] <= cpt[0] && cpt[0] <= threshold2)
+                        {
+                            inside_left = 1;
+                            cpt[0] = (cpt[0] - pmin[0]) / left_len * (xlen / 2) + pmin[0];
+                        }
+                        else
+                        {
+                            cpt[0] = (cpt[0] - threshold2) / right_len * (xlen / 2) + (xlen / 2) + pmin[0];
+                        }
+
+                        // 次へ
+                        bool outside = false; // 数値誤差とかでaabbの外側にでたら処理打ち切る
+
+                        for (int k = 0; k < 2; ++k)
+                        {
+                            if (pt[i].p[k] < current->pmin[k])
+                            {
+                                outside = true;
+                                pt[i].p[k] = current->pmin[k];
+                            }
+                            if (pt[i].p[k] > current->pmax[k])
+                            {
+                                outside = true;
+                                pt[i].p[k] = current->pmax[k];
+                            }
+                        }
+
+                        for (int c = 0; c < 4; ++c)
+                        {
+                            if (current->child[c]->inside(cpt[0], cpt[1]))
+                            {
+                                constexpr int idx_table[2][2] =
+                                {
+                                    { 3, 2 },
+                                    { 1, 0 },
+                                };
+                                pt[i].pdf = pt[i].pdf * 4.0f * current->child[idx_table[inside_upper][inside_left]]->prob / sum;
+
+                                current = current->child[c];
+                                break;
+                            }
+                        }
+
+                        if (outside)
+                            return;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     guiding::BinaryTree global_binary_tree;
@@ -806,7 +1066,7 @@ namespace integrator
     }
 
     // ここに素晴らしいintegratorを書く
-    Float3 get_radiance(int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int sample, int total_sample, int w, int h, int x, int y)
+    Float3 get_radiance(int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
     {
 
         const float current_time = rng.next01();
@@ -865,15 +1125,66 @@ namespace integrator
 
             if (material.ior == 0)
             {
-                // 次の方向サンプリング
-                const auto ts = hmath::tangentSpace(info.normal);
-                const Float3 tangent = std::get<0>(ts);
-                const Float3 binormal = std::get<1>(ts);
-                auto next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
+                auto* item = guiding::traverse(&global_binary_tree, info.pos);
+                float Prr = 0;
 
-                ray.dir = next_dir;
-                L += product(throughput, material.emission);
-                throughput = product(throughput, material.diffuse);
+                if (loop == 1 || !item)
+                    Prr = 1;
+                else
+                    Prr = 0.5; // TODO: 改良の余地あり
+
+                if (rng.next01() <= Prr)
+                {
+                    const auto ts = hmath::tangentSpace(info.normal);
+                    const Float3 tangent = std::get<0>(ts);
+                    const Float3 binormal = std::get<1>(ts);
+
+                    // 次の方向サンプリング
+                    auto next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
+                    const float pdf_omega = dot(info.normal, next_dir) / M_PI;
+
+                    float MISWeight = 1;
+                    if (Prr != 1)
+                    {
+                        float pdf_guiding = guiding::pdf_tree(next_dir, &item->quad_tree);
+                        float pdf_bsdf = pdf_omega;
+                        MISWeight = (1 / Prr) * (pdf_bsdf / (pdf_bsdf + pdf_guiding));
+                    }
+
+                    ray.dir = next_dir;
+                    L += product(throughput, material.emission);
+                    const float coeff = (float)(dot(info.normal, next_dir) / M_PI / pdf_omega) * MISWeight;
+                    throughput = product(throughput, material.diffuse * coeff);
+                }
+                else
+                {
+                    // 次の方向サンプリング
+                    guiding::Pt pt;
+                    pt.p[0] = rng.next01();
+                    pt.p[1] = rng.next01();
+                    guiding::sample(&item->quad_tree, &pt, 1);
+
+                    const float pdf_omega = pt.pdf / (4.0f * M_PI);
+
+                    const float phi = pt.p[0] * 2 * M_PI;
+                    const float theta = acos(pt.p[1] * 2 - 1);
+                    Float3 next_dir = polarCoordinateToDirectionWorldSpace<Float3>(theta, phi);
+
+                    float MISWeight = 1;
+                    {
+                        float pdf_guiding = pdf_omega;
+                        float pdf_bsdf = dot(info.normal, next_dir) / M_PI;
+                        MISWeight = (1 / (1 - Prr)) * (pdf_guiding / (pdf_bsdf + pdf_guiding));
+                    }
+
+                    if (MISWeight < 0)
+                        MISWeight = 0;
+
+                    ray.dir = next_dir;
+                    L += product(throughput, material.emission);
+                    const float coeff = (float)(dot(info.normal, next_dir) / M_PI / pdf_omega) * MISWeight;
+                    throughput = product(throughput, material.diffuse * coeff);
+                }
 
                 // guiding
                 if (depth + 1 < MAX_DEPTH)
@@ -976,53 +1287,198 @@ namespace integrator
         return L;
 #endif
 #if 0
-        integrator::Ray ray;
-        ray.org = initial_pos;
-        ray.dir = initial_dir;
-
-        auto info = intersect(ray);
-        float occluded = 0;
-        if (info.hit)
         {
-            auto hitpos = info.pos;
+            integrator::Ray ray;
+            ray.org = initial_pos;
+            ray.dir = initial_dir;
 
-            const auto ts = hmath::tangentSpace(info.normal);
-            const Float3 tangent = std::get<0>(ts);
-            const Float3 binormal = std::get<1>(ts);
-
-            // ao
-            for (int i = 0; i < 16; ++i)
+            auto info = intersect(ray);
+            float occluded = 0;
+            if (info.hit)
             {
-                auto next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
-                integrator::Ray aoray;
+                auto hitpos = info.pos;
 
-                aoray.org = hitpos;
-                aoray.dir = next_dir;
-                aoray.id = info.id;
-                aoray.near = 0;
-                aoray.anyhit = true;
-                auto ao_info = intersect(aoray);
+                const auto ts = hmath::tangentSpace(info.normal);
+                const Float3 tangent = std::get<0>(ts);
+                const Float3 binormal = std::get<1>(ts);
 
-                if (ao_info.hit)
+                // ao
+                for (int i = 0; i < 1; ++i)
                 {
-                    occluded += 1.0 / 16.0f;
+                    auto next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
+                    integrator::Ray aoray;
+
+                    aoray.org = hitpos;
+                    aoray.dir = next_dir;
+                    aoray.id = info.id;
+                    aoray.near = 0;
+                    aoray.anyhit = true;
+                    auto ao_info = intersect(aoray);
+
+                    if (ao_info.hit)
+                    {
+                        occluded += 1.0;
+                    }
+                }
+            }
+            else
+            {
+                return {};
+            }
+
+            return (1 - occluded) * Float3(1, 1, 1);
+        }
+#endif
+    }
+}
+
+void test()
+{
+    integrator::guiding::QuadTree tree;
+    std::mt19937 gen{ 0 };
+    std::normal_distribution<> x_dist(0.2, 0.3);
+    std::normal_distribution<> y_dist(0.5, 0.2);
+
+    hmath::Rng rng;
+
+    for (int loop = 0; loop < 64; ++loop)
+    {
+        for (int i = 0; i < 8192; ++i)
+        {
+            // integrator::guiding::direct_populate(1.0f, x_dist(gen), y_dist(gen), &tree);
+            hmath::Float3 dir = sample_uniform_sphere_surface<float, hmath::Float3>(rng);
+            float theta, phi;
+            directionToPolarCoordinate(dir, &theta, &phi);
+            // float v = theta / M_PI;
+            float v = (cos(theta) + 1) / 2;
+            float u = phi / (2 * M_PI);
+            integrator::guiding::direct_populate(1.0f, u, v, &tree);
+        }
+        integrator::guiding::Param p;
+        p.c = 12000; // TODO: ハイパラ
+        p.rho = 0.01;
+        integrator::guiding::refine_quad_tree_sub(p, tree.flux_total, &tree);
+        integrator::guiding::reset(&tree);
+    }
+    integrator::guiding::update_prob(&tree);
+
+    // warping
+        
+    constexpr int NUM = 8192;
+
+    integrator::guiding::Pt pt[NUM];
+    for (int i = 0; i < NUM; ++i)
+    {
+        pt[i].p[0] = dist01(gen);
+        pt[i].p[1] = dist01(gen);
+    }
+
+    integrator::guiding::sample(&tree, pt, NUM);
+
+    constexpr int W = 256;
+    std::vector<float> fdata(W * W * 3);
+#if 1
+    for (int i = 0; i < NUM; ++i)
+    {
+        const float u = pt[i].p[0];
+        const float v = pt[i].p[1];
+
+        const int ix = u * W;
+        const int iy = v * W;
+        fdata[(ix + iy * W) * 3 + 0] = pt[i].pdf;
+    }
+#endif
+#if 0
+    for (int iy = 0; iy < W; ++iy)
+    {
+        for (int ix = 0; ix < W; ++ix)
+        {
+            const float u = (float)(ix+0.5f) / W;
+            const float v = (float)(iy+0.5f) / W;
+            auto depth = integrator::guiding::calc_depth(u, v, &tree);
+            fdata[(ix + iy * W) * 3 + 0] = depth / 10.0f;
+        }
+    }
+#endif
+    hhdr::save("tree.hdr", fdata.data(), (int)W, (int)W, false);
+}
+
+void test2()
+{
+    integrator::guiding::QuadTree tree;
+    std::mt19937 gen{ 0 };
+    hmath::Rng rng;
+
+    for (int loop = 0; loop < 64; ++loop)
+    {
+        for (int i = 0; i < 8192; ++i)
+        {
+            // integrator::guiding::direct_populate(1.0f, x_dist(gen), y_dist(gen), &tree);
+            while (1)
+            {
+                hmath::Float3 dir = sample_uniform_sphere_surface<float, hmath::Float3>(rng);
+                float theta, phi;
+                directionToPolarCoordinate(dir, &theta, &phi);
+
+                if (-0.9 <= dir[2] && dir[2] < -0.7 &&
+                    0 < dir[1] && dir[1] < 1)
+                {
+                    // float v = theta / M_PI;
+                    float v = (cos(theta) + 1) / 2;
+                    float u = phi / (2 * M_PI);
+                    integrator::guiding::direct_populate(1.0f, u, v, &tree);
+                    break;
                 }
             }
         }
-        else
-        {
-            return {};
-        }
+        integrator::guiding::Param p;
+        p.c = 12000; // TODO: ハイパラ
+        p.rho = 0.001;
+        integrator::guiding::refine_quad_tree_sub(p, tree.flux_total, &tree);
+        integrator::guiding::reset(&tree);
+    }
+    integrator::guiding::update_prob(&tree);
 
-        return (1 - occluded) * Float3(1, 1, 1);
-#endif
+    constexpr int W = 256;
+    std::vector<float> fdata(W * W * 3);
+    for (int iy = 0; iy < W; ++iy)
+    {
+        for (int ix = 0; ix < W; ++ix)
+        {
+            const float u = (float)(ix + 0.5f) / W;
+            const float v = (float)(iy + 0.5f) / W;
+            auto depth = integrator::guiding::calc_depth(u, v, &tree);
+            fdata[(ix + iy * W) * 3 + 0] = depth / 10.0f;
+        }
+    }
+    hhdr::save("tree.hdr", fdata.data(), (int)W, (int)W, false);
+
+    constexpr int NUM = 64;
+
+    integrator::guiding::Pt pt[NUM];
+    for (int i = 0; i < NUM; ++i)
+    {
+        pt[i].p[0] = dist01(gen);
+        pt[i].p[1] = dist01(gen);
+    }
+    integrator::guiding::sample(&tree, pt, NUM);
+
+    for (int i = 0; i < NUM; ++i)
+    {
+        const float phi = pt[i].p[0] * 2 * M_PI;
+        const float theta = acos(pt[i].p[1] * 2 - 1);
+        auto next_dir = polarCoordinateToDirection<float>(theta, phi, hmath::Float3(0, 1, 0), hmath::Float3(1, 0, 0), hmath::Float3(0, 0, 1));
+
+        printf("(%f, %f), <%f, %f, %f>\n", theta, phi, next_dir[0], next_dir[1], next_dir[2]);
     }
 }
 
 int main(int argc, char** argv)
 {
-    integrator::guiding::QuadTree tree;
+    //test2();
+    //return 0;
 #if 0
+    integrator::guiding::QuadTree tree;
     tree.flux = 100;
     integrator::guiding::Param p;
     p.c = 12000; // TODO: ハイパラ
@@ -1035,8 +1491,8 @@ int main(int argc, char** argv)
     return 0;
 #endif
 
-    const int Width = 1920 / 4;
-    const int Height = 1080 / 4;
+    const int Width = 1920 / 2;
+    const int Height = 1080 / 2;
 
     FloatImage image(Width, Height);
     bool end_flag = false;
@@ -1091,6 +1547,7 @@ int main(int argc, char** argv)
     int image_index = 0;
     for (int loop = 1; loop <= 16; ++loop)
     {
+        image = FloatImage(Width, Height);
         const int num_sample = 1 << loop;
 
         printf("loop: %d\n", loop);
@@ -1102,16 +1559,16 @@ int main(int argc, char** argv)
 
             for (int ix = 0; ix < Width; ++ix)
             {
-                const int current_seed = (ix + iy * 8192) * 8192 + loop;
+                const int current_seed = (ix + iy * 8192) * 8192 + tid;
+
+                hmath::Rng rng;
+                rng.set_seed(current_seed);
 
                 for (int s = 0; s < num_sample; ++s)
                 {
-                    hmath::Rng rng;
-                    rng.set_seed(current_seed);
-
                     hmath::Float3 pos, dir;
                     integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
-                    auto ret = integrator::get_radiance(tid, rng, pos, dir, num_sample, Width, Height, ix, iy, current_seed);
+                    auto ret = integrator::get_radiance(tid, rng, pos, dir, loop, num_sample, Width, Height, ix, iy, current_seed);
 
                     if (is_valid(ret)) {
                         const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
@@ -1131,8 +1588,69 @@ int main(int argc, char** argv)
         }
 
         // debug
+        if (0)
         {
-            
+
+            hmath::Rng rng;
+            rng.set_seed(0);
+            hmath::Float3 pos, dir;
+            integrator::get_initial_ray(rng, Width, Height, Width/2, Height/2, pos, dir);
+            integrator::Ray ray;
+            ray.org = pos;
+            ray.dir = dir;
+            auto info = intersect(ray);
+            auto* tree = integrator::guiding::traverse(&integrator::global_binary_tree, info.pos);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                integrator::guiding::Pt pt;
+                pt.p[0] = rng.next01();
+                pt.p[1] = rng.next01();
+                sample(&tree->quad_tree, &pt, 1);
+
+                const float phi = pt.p[0] * 2 * M_PI;
+                const float theta = acos(pt.p[1] * 2 - 1);
+                auto next_dir = polarCoordinateToDirectionWorldSpace<hmath::Float3>(theta, phi);
+            }
+
+            for (int iy = 0; iy < Height; ++iy)
+            {
+                for (int ix = 0; ix < Width; ++ix)
+                {
+                    if (tree)
+                    {
+                        image.samples(ix, iy) = 1;
+
+                        //image(ix, iy) = tree->debug_color;
+                        //image(ix, iy) = hmath::Float3(tree->quad_tree.flux / 10 / num_sample, 0, 0);
+
+#if 1
+                        auto& aabb = tree->bbox;
+
+                        const float u = (ix + 0.5f) / Width;
+                        const float v = (iy + 0.5f) / Height;
+
+                        auto depth = integrator::guiding::calc_depth(u, v, &tree->quad_tree);
+
+                        hmath::Float3 tbl[] = {
+                            hmath::Float3(1, 0, 0),
+                            hmath::Float3(0, 1, 0),
+                            hmath::Float3(0, 0, 1),
+                            hmath::Float3(1, 1, 0),
+                            hmath::Float3(0, 1, 1),
+                            hmath::Float3(1, 1, 1),
+                        };
+
+                        if (depth >= 6)
+                            image(ix, iy) = hmath::Float3(0.1, 0.1, 0.1);
+                        else
+                            image(ix, iy) = tbl[depth];
+
+#endif
+                    }
+                }
+            }
+#if 0
             for (int iy = 0; iy < Height; ++iy)
             {
                 for (int ix = 0; ix < Width; ++ix)
@@ -1168,7 +1686,6 @@ int main(int argc, char** argv)
 
                                 auto depth = integrator::guiding::calc_depth(u, v, &tree->quad_tree);
 
-
                                 hmath::Float3 tbl[] = {
                                     hmath::Float3(1, 0, 0),
                                     hmath::Float3(0, 1, 0),
@@ -1190,20 +1707,22 @@ int main(int argc, char** argv)
                     }
                 }
             }
+#endif
         }
 
         // refine guiding
         {
             printf("BEGIN refine\n");
             integrator::guiding::Param p;
-            p.c = 1200; // TODO: ハイパラ
+            p.c = 120; // TODO: ハイパラ
             p.k = loop;
-            p.rho = 0.1f;
+            p.rho = 0.01f;
 
             integrator::guiding::merge_binary_tree(&integrator::global_binary_tree);
             integrator::guiding::refine_quad_tree(p, &integrator::global_binary_tree);
             integrator::guiding::refine_binary_tree(p, &integrator::global_binary_tree);
             integrator::guiding::reset(&integrator::global_binary_tree);
+            integrator::guiding::update_binarytree_prob(&integrator::global_binary_tree);
             printf("END refine\n");
         }
 

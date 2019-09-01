@@ -217,6 +217,7 @@ namespace hmath
         return sin(theta) * cos(phi) * tangent + cos(theta) * normal + sin(theta) * sin(phi) * binormal;
     }
 
+
     using Float3 = Vec3<float>;
     using Double3 = Vec3<double>;
 
