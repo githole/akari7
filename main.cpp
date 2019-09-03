@@ -20,7 +20,7 @@
 #include <vector>
 #include <atomic>
 #include <random>
-#include <omp.h>
+// #include <omp.h>
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -217,12 +217,14 @@ void save_image(const char* filename, FloatImage& image, bool enable_filter = fa
 
 
     double average = (double)total / (Width * Height);
-    std::cout << "Average: " << average << " samples/pixel" << std::endl;
+//    std::cout << "Average: " << average << " samples/pixel" << std::endl;
     stbi_write_png(filename, (int)Width, (int)Height, 3, uint8_tonemapped_image.data(), (int)(Width * sizeof(uint8_t) * 3));
-
+#if 0
     std::string hdrfilename = filename;
     hhdr::save((hdrfilename + +".hdr").c_str(), fdata.data(), (int)Width, (int)Height, false);
+#endif
 }
+
 
 
 namespace
@@ -347,7 +349,7 @@ namespace integrator
             info.id = hp.triangle_index;
             info.hit = ret;
 
-            auto& triangle = mesh::oldlib::triangles[hp.triangle_index];
+            const auto& triangle = mesh::oldlib::triangles[hp.triangle_index];
 
             auto e1 = triangle.v[1] - triangle.v[0];
             auto e2 = triangle.v[2] - triangle.v[0];
@@ -791,6 +793,7 @@ namespace integrator
         void refine_binary_tree(const Param& p, BinaryTree* tree, int depth = 0)
         {
             auto next = [&]() {
+#if 1
                 if (depth < 8)
                 {
                     std::thread th0([&]() {
@@ -808,6 +811,10 @@ namespace integrator
                     refine_binary_tree(p, tree->child[0].get(), depth + 1);
                     refine_binary_tree(p, tree->child[1].get(), depth + 1);
                 }
+#else
+                refine_binary_tree(p, tree->child[0].get(), depth + 1);
+                refine_binary_tree(p, tree->child[1].get(), depth + 1);
+#endif
             };
 
             if (!tree->isLeaf())
@@ -1123,10 +1130,19 @@ namespace integrator
         Float3 camera_dir = normalize(Float3(0, 0, 0) - camera_position);
         const float fovy = (45.0f) / 180.0f * hmath::pi<float>();
         */
+
+#if 1
+        // 本番
         hmath::Float3 camera_position(34, 4, 27);
         Float3 camera_dir = normalize(Float3(0, 5, 0) - camera_position);
         const float fovy = (29.0f) / 180.0f * hmath::pi<float>();
+#endif
 
+#if 0
+        hmath::Float3 camera_position(34, 20, 27);
+        Float3 camera_dir = normalize(Float3(0, 5, 0) - camera_position);
+        const float fovy = (45.0f) / 180.0f * hmath::pi<float>();
+#endif
         //const float ang = 0.15f;
         //Float3 camera_up(sin(ang), cos(ang), 0);
         Float3 camera_up(0, 1, 0);
@@ -1180,7 +1196,7 @@ namespace integrator
 
     std::mutex mutex;
 
-//#define PATHTRACING
+// #define PATHTRACING
     // ここに素晴らしいintegratorを書く
     Float3 get_radiance(const integrator::guiding::Param& p, int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
     {
@@ -1210,9 +1226,9 @@ namespace integrator
 
         // guiding
         guiding::Vertex vertex_list[MAX_DEPTH];
-        Float3 weight[MAX_DEPTH];
+        Float3 weight[MAX_DEPTH + 1];
         Float3 final_emission;
-        guiding::BinaryTree* item_list[MAX_DEPTH];
+        guiding::BinaryTree* item_list[MAX_DEPTH + 1] = {};
 
         int depth;
         for (depth = 0; depth < MAX_DEPTH; ++depth)
@@ -1235,15 +1251,12 @@ namespace integrator
                 vertex_list[depth].dir = org_ray.dir;
             }
 
-            auto& triangle = mesh::oldlib::triangles[info.id];
-            auto& material = *triangle.mat;
+            const auto& triangle = mesh::oldlib::triangles[info.id];
+            const auto& material = *triangle.mat;
 
             guiding::BinaryTree* item = nullptr;
 
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                item = guiding::traverse(&global_binary_tree, info.pos);
-            }
+            item = guiding::traverse(&global_binary_tree, info.pos);
 
             item_list[depth + 1] = item;
 
@@ -1286,7 +1299,6 @@ namespace integrator
                 }
                 else
                 {
-                    std::lock_guard<std::mutex> lock(mutex);
                     // 次の方向サンプリング
                     //guiding::Pt pt;
                     //pt.p[0] = rng.next01();
@@ -1638,12 +1650,13 @@ int main(int argc, char** argv)
 
     integrator::initialzie_camera(Width, Height);
 
-    bool end_flag = false;
+//    bool end_flag = false;
 
     // メッシュ読み込み
     printf("Load and Build.\n");
 //    auto mesh = mesh::loadMesh("head.obj");
-    auto mesh = mesh::loadMesh("C:/Code/VSProjects/pathological_mesher/pathological_mesher/rtcamp.obj");
+//    auto mesh = mesh::loadMesh("C:/Code/VSProjects/pathological_mesher/pathological_mesher/rtcamp.obj");
+    auto mesh = mesh::loadMesh("rtcamp.obj");
     {
         const auto numFace = mesh.index.size() / 3;
         mesh::oldlib::triangles.resize(numFace);
@@ -1693,137 +1706,182 @@ int main(int argc, char** argv)
     p.space_jitter_radius = 0.1f;
     p.dir_jitter_radius = 0.5f;
 
-    constexpr int LOOP = 16;
+    constexpr int LOOP = 64;
 
     FloatImage result_image(Width, Height);
     FloatImage image[LOOP];
+
+    for (int i = 0; i < LOOP; ++i)
+        image[i] = FloatImage(Width, Height);
+
     FloatImage current_image(Width, Height);
     double image_weight[LOOP];
 
-    int loop = 0;
+    int loop = 1;
+
+#if 1
+
+    std::atomic<bool> end_flag;
+    end_flag.store(false);
+
+    // 時間監視スレッドを立てる
+    double tmp_image_weight[LOOP];
+    std::thread watcher([&end_flag, &tmp_image_weight, Width, Height, &image, &loop, &image_weight]() {
+        FloatImage result_image(Width, Height);
+        int image_index = 0;
+        char buf[256];
+
+        // 開始時間を取得しておく
+        auto start = std::chrono::system_clock::now();
+
+        auto tick_start = start;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 0.1秒眠る
+
+            // 15秒経過を計る
+            auto current = std::chrono::system_clock::now();
+
+            const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(current - start).count();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(current - tick_start).count();
+
+//            const auto last = total_ms >= 57 * 1000;
+
+            const auto last = total_ms >= 57 * 1000;
+            if (ms >= 5 * 1000 || last)
+            {
+                const auto current_loop = loop;
+                for (int i = 1; i < current_loop; ++i)
+                {
+                    tmp_image_weight[i] = image_weight[i];
+                }
 
 #if 0
-    {
-        // 時間監視スレッドを立てる
-        std::thread watcher([&image, &loop, &image_weight]() {
-            FloatImage result_image(Width, Height);
-            int image_index = 0;
-            char buf[256];
-
-            // 開始時間を取得しておく
-            auto start = std::chrono::system_clock::now();
-
-            auto tick_start = start;
-            for (;;) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 0.1秒眠る
-
-                // 15秒経過を計る
-                auto current = std::chrono::system_clock::now();
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(current - tick_start).count() >= 3 * 1000) 
+                // image varを計算 (tmp)
+                double tmp_num_sample = 0;
+                for (int iy = 0; iy < Height; ++iy)
                 {
-                    const auto current_loop = loop;
-                    double tmp_image_weight[LOOP];
-                    for (int i = 1; i < current_loop; ++i)
+                    for (int ix = 0; ix < Width; ++ix)
                     {
-                        tmp_image_weight[i] = image_weight[i];
+                        tmp_num_sample += image[current_loop].samples(ix, iy);
                     }
+                }
+                tmp_image_weight[current_loop] = tmp_num_sample / (Width * Height);
 
-                    // image varを計算 (tmp)
-                    tmp_image_weight[current_loop] = 0;
-                    for (int iy = 0; iy < Height; ++iy)
+                double tmp_image_weight_sum = 0;
+                for (int i = 1; i <= current_loop; ++i)
+                {
+                    tmp_image_weight_sum += tmp_image_weight[i];
+                }
+#endif
+
+
+                double average_sample_per_pixel = 0;
+                for (int iy = 0; iy < Height; ++iy)
+                {
+                    for (int ix = 0; ix < Width; ++ix)
                     {
-                        for (int ix = 0; ix < Width; ++ix)
+                        tmp_image_weight[current_loop] = image[current_loop].samples(ix, iy);
+
+                        double tmp_image_weight_sum = 0;
+                        for (int i = 1; i <= current_loop; ++i)
                         {
-                            const double samples = image[current_loop].samples(ix, iy);
-                            const double lumi2 = image[current_loop].mean_var(ix, iy)[1];
-                            const double lumi = image[current_loop].mean_var(ix, iy)[0];
-                            const double X = lumi2 / samples;
-                            const double Y = pow(lumi / samples, 2);
-                            const double var = X - Y;
-                            tmp_image_weight[current_loop] += 1 / std::max(1e-64, var);
+                            tmp_image_weight_sum += tmp_image_weight[i];
+                            average_sample_per_pixel += image[i].samples(ix, iy);
                         }
-                    }
 
-                    double tmp_image_weight_sum = 0;
-                    for (int i = 1; i <= current_loop; ++i)
-                    {
-                        tmp_image_weight_sum += tmp_image_weight[i];
-                    }
-
-                    for (int iy = 0; iy < Height; ++iy)
-                    {
-                        for (int ix = 0; ix < Width; ++ix)
+                        hmath::Double3 col;
+                        for (int i = 1; i <= current_loop; ++i)
                         {
-                            hmath::Double3 col;
-                            for (int i = 1; i <= current_loop; ++i)
+                            if (image[i].samples(ix, iy) > 0)
                             {
                                 col = col +
                                     (tmp_image_weight[i] / tmp_image_weight_sum) * image[i](ix, iy) / (double)image[i].samples(ix, iy);
                             }
-                            result_image(ix, iy) = col;
-                            result_image.samples(ix, iy) = 1;
                         }
+                        result_image(ix, iy) = col;
+                        result_image.samples(ix, iy) = 1;
                     }
-
-
-                    tick_start = current;
-
-                    sprintf(buf, "%03d.png", image_index);
-                    save_image(buf, result_image);
-                    std::cout << "Saved: " << buf << std::endl;
-                    ++image_index;
-#if 0
-                    // 画像出力
-                    tick_start = current;
-
-                    sprintf(buf, "%03d.png", image_index);
-                    save_image(buf, image);
-                    std::cout << "Saved: " << buf << std::endl;
-                    ++image_index;
-#endif
                 }
 
+                printf("Average Sample per Pixel: %.2f\n", average_sample_per_pixel / (Width * Height));
 
-#if 0
+                tick_start = current;
 
-                // 123秒経過を計る
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(current - start).count() >= 122 * 1000 /* 安全をみてちょっと早めにする */) {
-                    // 画像出力して全部終了じゃい
-                    end_flag = true;
-                    save_image("final_image.png", image, true);
-                    std::cout << "Saved: final_image.png" << std::endl;
+                if (!last)
+                {
+                    sprintf(buf, "%03d.png", image_index);
+                }
+                else
+                {
+                    sprintf(buf, "final_image.png", image_index);
+                }
+                save_image(buf, result_image);
+                std::cout << "Saved: " << buf << std::endl;
+                ++image_index;
+
+                if (last)
+                {
+                    end_flag.store(true);
                     return;
                 }
+
+#if 0
+                // 画像出力
+                tick_start = current;
+
+                sprintf(buf, "%03d.png", image_index);
+                save_image(buf, image);
+                std::cout << "Saved: " << buf << std::endl;
+                ++image_index;
 #endif
             }
-        });
-    }
+
+
+#if 0
+
+            // 123秒経過を計る
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(current - start).count() >= 122 * 1000 /* 安全をみてちょっと早めにする */) {
+                // 画像出力して全部終了じゃい
+                end_flag = true;
+                save_image("final_image.png", image, true);
+                std::cout << "Saved: final_image.png" << std::endl;
+                return;
+            }
 #endif
+        }
+    });
+#endif
+    // omp_set_num_threads(NUM_THREAD);
+
     char buf[256];
     int image_index = 0;
-    for (loop = 1; loop <= 16; ++loop)
+    FloatImage raw_image(Width, Height);
+    for (loop = 1; loop < LOOP; ++loop)
     {
-
-        image[loop] = FloatImage(Width, Height);
         int num_sample = 1 << (loop - 1);
 
         p.k = loop;
         p.num_sample = num_sample;
 
         printf("loop: %d\n", loop);
-        
+
+        if (end_flag.load())
+            break;
+
+
+#if 0
 #pragma omp parallel for schedule(dynamic)
         for (int iy = 0; iy < Height; ++iy)
         {
-            const int tid = omp_get_thread_num();
-
-            if (tid == 0)
-            {
-                printf("<%d>", iy);
-            }
+            if (end_flag.load())
+                break;
 
             for (int ix = 0; ix < Width; ++ix)
             {
+                if (end_flag.load())
+                    break;
+
+                const int tid = omp_get_thread_num();
                 const int current_seed = (ix + iy * 8192);
 
                 hmath::Rng rng;
@@ -1831,11 +1889,13 @@ int main(int argc, char** argv)
 
                 for (int s = 0; s < num_sample; ++s)
                 {
+                    if (end_flag.load())
+                        break;
+
                     hmath::Float3 pos, dir;
                     integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
-                    auto ret = integrator::get_radiance(p, tid, rng, pos, dir, loop, s, num_sample, Width, Height, ix, iy);
 
-                    // ret = hmath::Float3(rng.next01(), 0, 0);
+                    auto ret = integrator::get_radiance(p, tid, rng, pos, dir, loop, s, num_sample, Width, Height, ix, iy);
 
                     if (is_valid(ret)) {
                         const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
@@ -1850,7 +1910,133 @@ int main(int argc, char** argv)
                 }
             }
         }
+#endif
+        struct Work
+        {
+            int begin_x = 0;
+            int begin_y = 0;
+            int end_x = 0;
+            int end_y = 0;
+            int num_sample = 0;
+            int loop = 0;
 
+            FloatImage* image = nullptr;
+            std::atomic<bool> working = false;
+
+            Work() {}
+
+            Work(const Work& w) noexcept
+            {
+                begin_x = w.begin_x;
+                begin_y = w.begin_y;
+                end_x = w.end_x;
+                end_y = w.end_y;
+                num_sample = w.num_sample;
+                loop = w.loop;
+                image = w.image;
+                working.store(w.working.load());
+            }
+        };
+
+        std::vector<Work> work_list;
+        int work_list_index = 0;
+        int num_loop = 0;
+
+        static constexpr int BlockWidth = 16;
+        static constexpr int BlockHeight = 16;
+        for (int begin_y = 0; begin_y < Height; begin_y += BlockHeight) {
+            for (int begin_x = 0; begin_x < Width; begin_x += BlockWidth) {
+                Work w;
+
+                w.begin_x = begin_x;
+                w.begin_y = begin_y;
+                w.end_x = hmath::clamp(begin_x + BlockWidth, 0, Width);
+                w.end_y = hmath::clamp(begin_y + BlockHeight, 0, Height);
+                w.image = &image[loop];
+                w.num_sample = num_sample;
+                w.loop = loop;
+
+                work_list.push_back(w);
+            }
+        }
+
+        // スレッドに処理を振り分ける
+        std::vector<std::thread> thread_list;
+        std::mutex work_list_mutex;
+
+        for (int thread_id = 0; thread_id < NUM_THREAD; ++thread_id) {
+            std::thread thread([&loop, &p, Width, Height, &end_flag, thread_id, &work_list, &work_list_index, &num_loop, &work_list_mutex]() {
+                hetc::set_thread_group(thread_id);
+
+                hmath::Rng rng;
+                rng.set_seed(thread_id + loop * NUM_THREAD);
+
+                for (;;) {
+                    Work* current_work = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(work_list_mutex);
+
+                        if (work_list_index < work_list.size())
+                        {
+                            if (!work_list[work_list_index].working.load()) {
+                                current_work = &work_list[work_list_index];
+                                work_list[work_list_index].working.store(true);
+                            }
+                            work_list_index++;
+                        }
+                    }
+
+                    if (current_work == nullptr) {
+                        break;
+                    }
+
+                    // タスク処理
+                    {
+                        for (int iy = current_work->begin_y; iy < current_work->end_y; ++iy)
+                        {
+                            if (end_flag.load())
+                                break;
+
+                            for (int ix = current_work->begin_x; ix < current_work->end_x; ++ix)
+                            {
+                                if (end_flag.load())
+                                    break;
+
+                                for (int s = 0; s < current_work->num_sample; ++s)
+                                {
+                                    if (end_flag.load())
+                                        break;
+
+                                    hmath::Float3 pos, dir;
+                                    integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
+
+                                    auto ret = integrator::get_radiance(p, thread_id, rng, pos, dir, current_work->loop, s, current_work->num_sample, Width, Height, ix, iy);
+
+                                    if (is_valid(ret)) {
+                                        const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
+
+                                        // 分散計算用
+                                        const auto lumi = dot(dret, double_rgb2y);
+                                        (*current_work->image).mean_var(ix, iy)[0] += lumi;
+                                        (*current_work->image).mean_var(ix, iy)[1] += lumi * lumi;
+                                        (*current_work->image)(ix, iy) += dret;
+                                        (*current_work->image).samples(ix, iy) += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            thread_list.push_back(std::move(thread));
+        }
+
+        for (auto& t : thread_list) {
+            t.join();
+        }
+
+#if 0
         // image varを計算
         double weight = 0;
         for (int iy = 0; iy < Height; ++iy)
@@ -1864,12 +2050,21 @@ int main(int argc, char** argv)
                 const double Y = pow(lumi / samples, 2);
                 const double var = X - Y;
                 if (var > 0)
+                {
                     weight += (1 / var) / (Width * Height);
+                    raw_image(ix, iy) = hmath::Float3(var, 0, 0);
+                    raw_image.samples(ix, iy) = 1;
+                }
             }
         }
+#endif
+        // weightはサンプル数にします
+        double weight = num_sample;
+#if 0
         printf("\n========================\n");
         printf("%e\n", weight);
         printf("========================\n");
+#endif
         image_weight[loop] = weight;
 
         double image_weight_sum = 0;
@@ -1878,6 +2073,7 @@ int main(int argc, char** argv)
             image_weight_sum += image_weight[i];
         }
 
+#if 0
         // 重み付き和を計算
 #pragma omp parallel for schedule(dynamic)
         for (int iy = 0; iy < Height; ++iy)
@@ -1891,22 +2087,25 @@ int main(int argc, char** argv)
                     col = col + (image_weight[i] / image_weight_sum) * image[i](ix, iy) / (double)image[i].samples(ix, iy);
                 }
 
-                col = image[loop](ix, iy) / (double)image[loop].samples(ix, iy);
-
                 result_image(ix, iy) = col;
                 result_image.samples(ix, iy) = 1;
+
+                raw_image(ix, iy) = image[loop](ix, iy) / (double)image[loop].samples(ix, iy);
+                raw_image.samples(ix, iy) = 1;
             }
         }
+#endif
 
+#if 0
         printf("\n");
         for (int i = 1; i <= loop; ++i)
         {
             printf("[%f]", (image_weight[i] / image_weight_sum));
         }
         printf("\n");
-
+#endif
         // debug
-        if (1)
+        if (0)
         {
 
 #if 0
@@ -2031,7 +2230,6 @@ int main(int argc, char** argv)
         // refine guiding
         {
             printf("BEGIN refine\n");
-
             integrator::guiding::merge_binary_tree(&integrator::global_binary_tree);
             integrator::guiding::refine_quad_tree(p, &integrator::global_binary_tree);
             integrator::guiding::refine_binary_tree(p, &integrator::global_binary_tree);
@@ -2040,14 +2238,21 @@ int main(int argc, char** argv)
             printf("END refine\n");
         }
 
+        printf("END loop\n\n");
+#if 0
         // save
         {
             sprintf(buf, "%03d.png", image_index);
 //            save_image(buf, image[loop]);
             save_image(buf, result_image);
+
+            sprintf(buf, "raw_%03d.png", image_index);
+            save_image(buf, raw_image);
+
             std::cout << "Saved: " << buf << std::endl << std::endl;
             ++image_index;
         }
+#endif
     }
 
 
@@ -2205,8 +2410,8 @@ int main(int argc, char** argv)
         t.join();
     }
 
-    watcher.join();
 #endif
+    watcher.join();
 
     return 0;
 }
