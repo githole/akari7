@@ -165,7 +165,7 @@ void save_image(const char* filename, FloatImage& image, bool enable_filter = fa
     std::vector<float> fdata(Width * Height * 3);
     std::vector<float> fdata2(Width * Height * 3);
 
-    fmath::PowGenerator degamma(1.2f /* ちょいコントラスト強める */ / 2.2f);
+    fmath::PowGenerator degamma(1.0f / 2.2f);
 
     for (int iy = 0; iy < Height; ++iy) {
         for (int ix = 0; ix < Width; ++ix) {
@@ -1178,6 +1178,8 @@ namespace integrator
         initial_dir = normalize(initial_pos - g_camera_position);
     }
 
+    std::mutex mutex;
+
 //#define PATHTRACING
     // ここに素晴らしいintegratorを書く
     Float3 get_radiance(const integrator::guiding::Param& p, int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
@@ -1236,7 +1238,13 @@ namespace integrator
             auto& triangle = mesh::oldlib::triangles[info.id];
             auto& material = *triangle.mat;
 
-            auto* item = guiding::traverse(&global_binary_tree, info.pos);
+            guiding::BinaryTree* item = nullptr;
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                item = guiding::traverse(&global_binary_tree, info.pos);
+            }
+
             item_list[depth + 1] = item;
 
             if (material.ior == 0)
@@ -1278,19 +1286,25 @@ namespace integrator
                 }
                 else
                 {
+                    std::lock_guard<std::mutex> lock(mutex);
                     // 次の方向サンプリング
                     //guiding::Pt pt;
                     //pt.p[0] = rng.next01();
                     //pt.p[1] = rng.next01();
                     //guiding::sample(&item->quad_tree, &pt, 1);
-
+#if 1
                     auto pt = guiding::sample2(rng, &item->quad_tree);
-
                     const float pdf_omega = pt.pdf / (4.0f * M_PI);
-
                     const float phi = pt.p[0] * 2 * M_PI;
                     const float theta = acos(pt.p[1] * 2 - 1);
                     Float3 next_dir = polarCoordinateToDirectionWorldSpace<Float3>(theta, phi);
+#else
+                    const auto ts = hmath::tangentSpace(info.normal);
+                    const Float3 tangent = std::get<0>(ts);
+                    const Float3 binormal = std::get<1>(ts);
+                    Float3 next_dir = cosine_weighted(rng, info.normal, tangent, binormal);
+                    const float pdf_omega = 1 / (4.0f * M_PI);
+#endif
 
                     float MISWeight = 1;
                     {
@@ -1306,7 +1320,6 @@ namespace integrator
                     L += product(throughput, material.emission);
                     const float coeff = (float)(std::max(0.0f, dot(info.normal, next_dir)) / M_PI / pdf_omega) * MISWeight;
                     throughput = product(throughput, material.diffuse * coeff);
-
                 }
 
                 // guiding
@@ -1684,11 +1697,111 @@ int main(int argc, char** argv)
 
     FloatImage result_image(Width, Height);
     FloatImage image[LOOP];
+    FloatImage current_image(Width, Height);
     double image_weight[LOOP];
 
+    int loop = 0;
+
+#if 0
+    {
+        // 時間監視スレッドを立てる
+        std::thread watcher([&image, &loop, &image_weight]() {
+            FloatImage result_image(Width, Height);
+            int image_index = 0;
+            char buf[256];
+
+            // 開始時間を取得しておく
+            auto start = std::chrono::system_clock::now();
+
+            auto tick_start = start;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 0.1秒眠る
+
+                // 15秒経過を計る
+                auto current = std::chrono::system_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(current - tick_start).count() >= 3 * 1000) 
+                {
+                    const auto current_loop = loop;
+                    double tmp_image_weight[LOOP];
+                    for (int i = 1; i < current_loop; ++i)
+                    {
+                        tmp_image_weight[i] = image_weight[i];
+                    }
+
+                    // image varを計算 (tmp)
+                    tmp_image_weight[current_loop] = 0;
+                    for (int iy = 0; iy < Height; ++iy)
+                    {
+                        for (int ix = 0; ix < Width; ++ix)
+                        {
+                            const double samples = image[current_loop].samples(ix, iy);
+                            const double lumi2 = image[current_loop].mean_var(ix, iy)[1];
+                            const double lumi = image[current_loop].mean_var(ix, iy)[0];
+                            const double X = lumi2 / samples;
+                            const double Y = pow(lumi / samples, 2);
+                            const double var = X - Y;
+                            tmp_image_weight[current_loop] += 1 / std::max(1e-64, var);
+                        }
+                    }
+
+                    double tmp_image_weight_sum = 0;
+                    for (int i = 1; i <= current_loop; ++i)
+                    {
+                        tmp_image_weight_sum += tmp_image_weight[i];
+                    }
+
+                    for (int iy = 0; iy < Height; ++iy)
+                    {
+                        for (int ix = 0; ix < Width; ++ix)
+                        {
+                            hmath::Double3 col;
+                            for (int i = 1; i <= current_loop; ++i)
+                            {
+                                col = col +
+                                    (tmp_image_weight[i] / tmp_image_weight_sum) * image[i](ix, iy) / (double)image[i].samples(ix, iy);
+                            }
+                            result_image(ix, iy) = col;
+                            result_image.samples(ix, iy) = 1;
+                        }
+                    }
+
+
+                    tick_start = current;
+
+                    sprintf(buf, "%03d.png", image_index);
+                    save_image(buf, result_image);
+                    std::cout << "Saved: " << buf << std::endl;
+                    ++image_index;
+#if 0
+                    // 画像出力
+                    tick_start = current;
+
+                    sprintf(buf, "%03d.png", image_index);
+                    save_image(buf, image);
+                    std::cout << "Saved: " << buf << std::endl;
+                    ++image_index;
+#endif
+                }
+
+
+#if 0
+
+                // 123秒経過を計る
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(current - start).count() >= 122 * 1000 /* 安全をみてちょっと早めにする */) {
+                    // 画像出力して全部終了じゃい
+                    end_flag = true;
+                    save_image("final_image.png", image, true);
+                    std::cout << "Saved: final_image.png" << std::endl;
+                    return;
+                }
+#endif
+            }
+        });
+    }
+#endif
     char buf[256];
     int image_index = 0;
-    for (int loop = 1; loop <= 16; ++loop)
+    for (loop = 1; loop <= 16; ++loop)
     {
 
         image[loop] = FloatImage(Width, Height);
@@ -1706,12 +1819,12 @@ int main(int argc, char** argv)
 
             if (tid == 0)
             {
-                printf("[%d]", iy);
+                printf("<%d>", iy);
             }
 
             for (int ix = 0; ix < Width; ++ix)
             {
-                const int current_seed = (ix + iy * 8192) * 8192;
+                const int current_seed = (ix + iy * 8192);
 
                 hmath::Rng rng;
                 rng.set_seed(current_seed);
@@ -1722,6 +1835,8 @@ int main(int argc, char** argv)
                     integrator::get_initial_ray(rng, Width, Height, ix, iy, pos, dir);
                     auto ret = integrator::get_radiance(p, tid, rng, pos, dir, loop, s, num_sample, Width, Height, ix, iy);
 
+                    // ret = hmath::Float3(rng.next01(), 0, 0);
+
                     if (is_valid(ret)) {
                         const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
 
@@ -1729,7 +1844,6 @@ int main(int argc, char** argv)
                         const auto lumi = dot(dret, double_rgb2y);
                         image[loop].mean_var(ix, iy)[0] += lumi;
                         image[loop].mean_var(ix, iy)[1] += lumi * lumi;
-
                         image[loop](ix, iy) += dret;
                         image[loop].samples(ix, iy) += 1;
                     }
@@ -1749,9 +1863,13 @@ int main(int argc, char** argv)
                 const double X = lumi2 / samples;
                 const double Y = pow(lumi / samples, 2);
                 const double var = X - Y;
-                weight += 1 / std::max(1e-64, var);
+                if (var > 0)
+                    weight += (1 / var) / (Width * Height);
             }
         }
+        printf("\n========================\n");
+        printf("%e\n", weight);
+        printf("========================\n");
         image_weight[loop] = weight;
 
         double image_weight_sum = 0;
@@ -1770,13 +1888,17 @@ int main(int argc, char** argv)
                 hmath::Double3 col;
                 for (int i = 1; i <= loop; ++i)
                 {
-                    col = col + (image_weight[i] / image_weight_sum) * image[loop](ix, iy) / (double)image[loop].samples(ix, iy);
+                    col = col + (image_weight[i] / image_weight_sum) * image[i](ix, iy) / (double)image[i].samples(ix, iy);
                 }
+
+                col = image[loop](ix, iy) / (double)image[loop].samples(ix, iy);
+
                 result_image(ix, iy) = col;
                 result_image.samples(ix, iy) = 1;
             }
         }
 
+        printf("\n");
         for (int i = 1; i <= loop; ++i)
         {
             printf("[%f]", (image_weight[i] / image_weight_sum));
@@ -1784,7 +1906,7 @@ int main(int argc, char** argv)
         printf("\n");
 
         // debug
-        if (0)
+        if (1)
         {
 
 #if 0
@@ -1923,7 +2045,7 @@ int main(int argc, char** argv)
             sprintf(buf, "%03d.png", image_index);
 //            save_image(buf, image[loop]);
             save_image(buf, result_image);
-            std::cout << "Saved: " << buf << std::endl;
+            std::cout << "Saved: " << buf << std::endl << std::endl;
             ++image_index;
         }
     }
