@@ -90,8 +90,9 @@ namespace mesh
     {
         // TODO: 外部からなんとかできるようにしたいところではある
         material_table.clear();
-        material_table.push_back({ hmath::Float3(0.18f, 0.18f, 0.18f), hmath::Float3(0, 0, 0) });
-        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(160, 80, 20) / 64.0f * 64.0f });
+        material_table.push_back({ hmath::Float3(0.3f, 0.3f, 0.3f), hmath::Float3(0, 0, 0) });
+//        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(160, 80, 20) / 64.0f * 64.0f });
+        material_table.push_back({ hmath::Float3(0.0f, 0.0f, 0.0f), hmath::Float3(50, 80, 120) / 64.0f * 64.0f * 2.0f });
         material_table.push_back({ hmath::Float3(1.0f, 1.0f, 1.0f), hmath::Float3(0, 0, 0), 1.5f });
 
         std::vector<uint32_t> material_map;
@@ -390,6 +391,7 @@ namespace integrator
             float c;
             float k;
             float rho;
+            float num_sample;
 
             float space_jitter_radius;
             float dir_jitter_radius;
@@ -408,10 +410,14 @@ namespace integrator
         {
             // 全部nullならleaf
             // std::unique_ptr<QuadTree> child[4] = {};
-            QuadTree* child[4] = {};
+            //QuadTree* child[4] = {};
+            
+            QuadTree* child = nullptr;
+
             bool isLeaf() const
             {
-                return !child[0] && !child[1] && !child[2] && !child[3];
+//                return !child[0] && !child[1] && !child[2] && !child[3];
+                return !child;
             }
 
             float flux_tmp[NUM_THREAD] = {};
@@ -431,15 +437,15 @@ namespace integrator
 
             void deallocate()
             {
-                for (int c = 0; c < 4; ++c)
+                if (child)
                 {
-                    if (child[c])
+                    for (int c = 0; c < 4; ++c)
                     {
-                        child[c]->deallocate();
-                        delete child[c];
-                        child[c] = nullptr;
+                        child[c].deallocate();
                     }
                 }
+                delete[] child;
+                child = nullptr;
             }
 
             QuadTree() = default;
@@ -450,9 +456,9 @@ namespace integrator
 
             QuadTree& operator=(QuadTree&& tree)
             {
+                this->child = tree.child;
                 for (int c = 0; c < 4; ++c)
                 {
-                    this->child[c] = tree.child[c];
                     this->flux_total = tree.flux_total;
                     this->prob = tree.prob;
                     std::copy(tree.flux_tmp, tree.flux_tmp + NUM_THREAD, this->flux_tmp);
@@ -460,8 +466,8 @@ namespace integrator
                     this->pmax[0] = tree.pmax[0];
                     this->pmin[1] = tree.pmin[1];
                     this->pmax[1] = tree.pmax[1];
-                    tree.child[c] = nullptr;
                 }
+                tree.child = nullptr;
                 return *this;
             }
 
@@ -483,7 +489,7 @@ namespace integrator
                 float sum = 0;
                 for (int c = 0; c < 4; ++c)
                 {
-                    sum += update_prob(tree->child[c], prob);
+                    sum += update_prob(&tree->child[c], prob);
                 }
                 tree->prob = sum;
                 return sum;
@@ -501,9 +507,13 @@ namespace integrator
             tree->prob = 0;
             tree->flux_total = 0;
             std::fill(tree->flux_tmp, tree->flux_tmp + NUM_THREAD, 0);
-            for (int c = 0; c < 4; ++c)
+
+            if (!tree->isLeaf())
             {
-                reset(tree->child[c]);
+                for (int c = 0; c < 4; ++c)
+                {
+                    reset(&tree->child[c]);
+                }
             }
         }
 
@@ -513,9 +523,9 @@ namespace integrator
             {
                 for (int c = 0; c < 4; ++c)
                 {
-                    if (tree->child[c]->inside(u, v))
+                    if (tree->child[c].inside(u, v))
                     {
-                        return calc_depth(u, v, tree->child[c], depth + 1);
+                        return calc_depth(u, v, &tree->child[c], depth + 1);
                     }
                 }
 
@@ -532,7 +542,7 @@ namespace integrator
                 {
                     for (int c = 0; c < 4; ++c)
                     {
-                        direct_populate(value, u, v, tree->child[c]);
+                        direct_populate(value, u, v, &tree->child[c]);
                     }
                 }
             }
@@ -553,7 +563,7 @@ namespace integrator
                 {
                     for (int c = 0; c < 4; ++c)
                     {
-                        populate(thread_id, pos, dir, radiance, tree->child[c]);
+                        populate(thread_id, pos, dir, radiance, &tree->child[c]);
                     }
                 }
             }
@@ -574,10 +584,10 @@ namespace integrator
 
             if (!tree->isLeaf())
             {
+                copy_tree.child = new QuadTree[4];
                 for (int c = 0; c < 4; ++c)
                 {
-                    copy_tree.child[c] = new QuadTree();
-                    *copy_tree.child[c] = copy(tree->child[c]);
+                    copy_tree.child[c] = copy(&tree->child[c]);
                 }
             }
 
@@ -601,36 +611,36 @@ namespace integrator
                         (tree->pmin[1] + tree->pmax[1]) / 2,
                     };
 
+                    tree->child = new QuadTree[4];
                     for (int c = 0; c < 4; ++c)
                     {
                         // tree->child[c] = std::unique_ptr<QuadTree>(new QuadTree());
-                        tree->child[c] = new QuadTree();
-                        tree->child[c]->flux_total = tree->flux_total / 4;
+                        tree->child[c].flux_total = tree->flux_total / 4;
                     }
 
-                    tree->child[0]->pmin[0] = tree->pmin[0];
-                    tree->child[0]->pmin[1] = tree->pmin[1];
-                    tree->child[0]->pmax[0] = mid[0];
-                    tree->child[0]->pmax[1] = mid[1];
-
-                    tree->child[1]->pmin[0] = mid[0];
-                    tree->child[1]->pmin[1] = tree->pmin[1];
-                    tree->child[1]->pmax[0] = tree->pmax[0];
-                    tree->child[1]->pmax[1] = mid[1];
-
-                    tree->child[2]->pmin[0] = tree->pmin[0];
-                    tree->child[2]->pmin[1] = mid[1];
-                    tree->child[2]->pmax[0] = mid[0];
-                    tree->child[2]->pmax[1] = tree->pmax[1];
-
-                    tree->child[3]->pmin[0] = mid[0];
-                    tree->child[3]->pmin[1] = mid[1];
-                    tree->child[3]->pmax[0] = tree->pmax[0];
-                    tree->child[3]->pmax[1] = tree->pmax[1];
+                    tree->child[0].pmin[0] = tree->pmin[0];
+                    tree->child[0].pmin[1] = tree->pmin[1];
+                    tree->child[0].pmax[0] = mid[0];
+                    tree->child[0].pmax[1] = mid[1];
+                                  
+                    tree->child[1].pmin[0] = mid[0];
+                    tree->child[1].pmin[1] = tree->pmin[1];
+                    tree->child[1].pmax[0] = tree->pmax[0];
+                    tree->child[1].pmax[1] = mid[1];
+                                  
+                    tree->child[2].pmin[0] = tree->pmin[0];
+                    tree->child[2].pmin[1] = mid[1];
+                    tree->child[2].pmax[0] = mid[0];
+                    tree->child[2].pmax[1] = tree->pmax[1];
+                                  
+                    tree->child[3].pmin[0] = mid[0];
+                    tree->child[3].pmin[1] = mid[1];
+                    tree->child[3].pmax[0] = tree->pmax[0];
+                    tree->child[3].pmax[1] = tree->pmax[1];
 
                     for (int c = 0; c < 4; ++c)
                     {
-                        refine_quad_tree_sub(p, total_flux, tree->child[c]);
+                        refine_quad_tree_sub(p, total_flux, &tree->child[c]);
                     }
                 }
                 return;
@@ -643,15 +653,16 @@ namespace integrator
                 // まとめる
                 for (int c = 0; c < 4; ++c)
                 {
-                    tree->child[c] = nullptr;
+                    tree->child[c].deallocate();
                 }
+                tree->child = nullptr;
                 return;
             }
 #endif
 
             for (int c = 0; c < 4; ++c)
             {
-                refine_quad_tree_sub(p, total_flux, tree->child[c]);
+                refine_quad_tree_sub(p, total_flux, &tree->child[c]);
             }
         }
 
@@ -695,9 +706,12 @@ namespace integrator
                 tree->flux_total += tree->flux_tmp[i];
             }
 
-            for (int c = 0; c < 4; ++c)
+            if (!tree->isLeaf())
             {
-                merge_binary_tree_sub(tree->child[c]);
+                for (int c = 0; c < 4; ++c)
+                {
+                    merge_binary_tree_sub(&tree->child[c]);
+                }
             }
         }
 
@@ -777,7 +791,7 @@ namespace integrator
         void refine_binary_tree(const Param& p, BinaryTree* tree, int depth = 0)
         {
             auto next = [&]() {
-                if (depth < 5)
+                if (depth < 8)
                 {
                     std::thread th0([&]() {
                         refine_binary_tree(p, tree->child[0].get(), depth + 1);
@@ -804,7 +818,8 @@ namespace integrator
             else
             {
                 // leaf
-                if (tree->num_sample_total > p.c * sqrt(pow(2.0f, p.k)))
+//                if (tree->num_sample_total > p.c * sqrt(pow(2.0f, p.k)))
+                if (tree->num_sample_total > p.c * sqrt(p.num_sample))
                 {
                     // subdivide
                     const auto split_axis = tree->split_axis;
@@ -885,18 +900,18 @@ namespace integrator
             {
                 if (!current->isLeaf())
                 {
-                    float p00 = current->child[0]->prob;
-                    float p01 = current->child[1]->prob;
-                    float p10 = current->child[2]->prob;
-                    float p11 = current->child[3]->prob;
+                    float p00 = current->child[0].prob;
+                    float p01 = current->child[1].prob;
+                    float p10 = current->child[2].prob;
+                    float p11 = current->child[3].prob;
                     const auto sum = p00 + p01 + p10 + p11;
 
                     for (int c = 0; c < 4; ++c)
                     {
-                        if (current->child[c]->inside(u, v))
+                        if (current->child[c].inside(u, v))
                         {
-                            pdf = pdf * 4.0f * current->child[c]->prob / sum;
-                            current = current->child[c];
+                            pdf = pdf * 4.0f * current->child[c].prob / sum;
+                            current = &current->child[c];
                             break;
                         }
                     }
@@ -919,10 +934,10 @@ namespace integrator
             {
                 if (!current->isLeaf())
                 {
-                    float p00 = current->child[0]->prob;
-                    float p01 = current->child[1]->prob;
-                    float p10 = current->child[2]->prob;
-                    float p11 = current->child[3]->prob;
+                    float p00 = current->child[0].prob;
+                    float p01 = current->child[1].prob;
+                    float p10 = current->child[2].prob;
+                    float p11 = current->child[3].prob;
                     const auto sum = p00 + p01 + p10 + p11;
 
                     float P00 = p00 / sum;
@@ -949,8 +964,8 @@ namespace integrator
                         index = 3;
                     }
 
-                    pdf = pdf * 4.0f * current->child[index]->prob / sum;
-                    current = current->child[index];
+                    pdf = pdf * 4.0f * current->child[index].prob / sum;
+                    current = &current->child[index];
                 }
                 else
                 {
@@ -980,10 +995,10 @@ namespace integrator
                     float pmax[2] = { current->pmax[0], current->pmax[1] };
                     if (!current->isLeaf())
                     {
-                        float p00 = current->child[0]->prob;
-                        float p01 = current->child[1]->prob;
-                        float p10 = current->child[2]->prob;
-                        float p11 = current->child[3]->prob;
+                        float p00 = current->child[0].prob;
+                        float p01 = current->child[1].prob;
+                        float p10 = current->child[2].prob;
+                        float p11 = current->child[3].prob;
 
                         // 上下warp
                         const auto sum = p00 + p01 + p10 + p11;
@@ -1057,16 +1072,16 @@ namespace integrator
 
                         for (int c = 0; c < 4; ++c)
                         {
-                            if (current->child[c]->inside(cpt[0], cpt[1]))
+                            if (current->child[c].inside(cpt[0], cpt[1]))
                             {
                                 constexpr int idx_table[2][2] =
                                 {
                                     { 3, 2 },
                                     { 1, 0 },
                                 };
-                                pt[i].pdf = pt[i].pdf * 4.0f * current->child[idx_table[inside_upper][inside_left]]->prob / sum;
+                                pt[i].pdf = pt[i].pdf * 4.0f * current->child[idx_table[inside_upper][inside_left]].prob / sum;
 
-                                current = current->child[c];
+                                current = &current->child[c];
                                 break;
                             }
                         }
@@ -1086,7 +1101,14 @@ namespace integrator
     guiding::BinaryTree global_binary_tree;
     guiding::BinaryTree* debug_tree;
 
-    void get_initial_ray(Rng& rng, int w, int h, int x, int y, Float3& initial_pos, Float3& initial_dir)
+
+    Float3 g_camera_position;
+    Float3 g_camera_dir;
+    Float3 g_screen_side;
+    Float3 g_screen_up;
+    const float g_length = 0.1f;
+
+    void initialzie_camera(int w, int h)
     {
         // カメラデータを直接突っ込む
 #if 0
@@ -1094,37 +1116,52 @@ namespace integrator
         Float3 camera_dir = normalize(Float3(0, 0, 0) - camera_position);
         const float fovy = (90.0f) / 180.0f * hmath::pi<float>();
 #endif
-        hmath::Float3 camera_position(34, 15, 32);
+        //        hmath::Float3 camera_position(34, 15, 32);
+
+        /*
+        hmath::Float3 camera_position(24, 15, 17);
         Float3 camera_dir = normalize(Float3(0, 0, 0) - camera_position);
         const float fovy = (45.0f) / 180.0f * hmath::pi<float>();
+        */
+        hmath::Float3 camera_position(34, 4, 27);
+        Float3 camera_dir = normalize(Float3(0, 5, 0) - camera_position);
+        const float fovy = (29.0f) / 180.0f * hmath::pi<float>();
 
         //const float ang = 0.15f;
         //Float3 camera_up(sin(ang), cos(ang), 0);
         Float3 camera_up(0, 1, 0);
 
         const auto aspect = (float)w / h;
-        const float length = 0.1f;
-        const float screen_height = length * tan(fovy / 2);
+        const float screen_height = g_length * tan(fovy / 2);
         const float screen_width = screen_height * aspect;
         const auto screen_side = normalize(cross(camera_dir, camera_up)) * screen_width;
         const auto screen_up = normalize(cross(camera_dir, screen_side)) * screen_height;
 
+        g_camera_position = camera_position;
+        g_camera_dir = camera_dir;
+        g_screen_side = screen_side;
+        g_screen_up = screen_up;
+    }
+
+    void get_initial_ray(Rng& rng, int w, int h, int x, int y, Float3& initial_pos, Float3& initial_dir)
+    {
+
         const float U = ((float)(x + rng.next01()) / w) * 2 - 1;
         const float V = ((float)(y + rng.next01()) / h) * 2 - 1;
         const float r = (U * U + V * V);
-
+#if 1
         auto new_U = U;
         auto new_V = V;
+#else
 #if 0
-#if 1
         int ch = rng.next() % 3;
         float table[3] = { -0.05f, 0, 0.05f };
         const float k1 = table[ch];
         const float new_U = U * (1.0f + k1 * r);
         const float new_V = V * (1.0f + k1 * r);
 #else
-        const float cjitter = rng.next01() * 0.1 - 0.05;
-        const float ch = -0.2f + cjitter;
+        const float cjitter = rng.next01() * 0.01 - 0.005;
+        const float ch = 0.1f + cjitter;
 
         const float k1 = ch;
         const float new_U = U * (1.0f + k1 * r);
@@ -1137,16 +1174,14 @@ namespace integrator
 #endif
 #endif
 
-        initial_pos = camera_position + camera_dir * length + new_U * screen_side + new_V * screen_up;
-        initial_dir = normalize(initial_pos - camera_position);
+        initial_pos = g_camera_position + g_camera_dir * g_length + new_U * g_screen_side + new_V * g_screen_up;
+        initial_dir = normalize(initial_pos - g_camera_position);
     }
 
 //#define PATHTRACING
     // ここに素晴らしいintegratorを書く
     Float3 get_radiance(const integrator::guiding::Param& p, int thread_id, Rng& rng, Float3& initial_pos, Float3& initial_dir, int loop, int sample, int total_sample, int w, int h, int x, int y)
     {
-        const float current_time = rng.next01();
-
 #if 0
         // guiding debug
         if (x == 0 && y == 0 && sample == 0)
@@ -1185,7 +1220,8 @@ namespace integrator
             if (!info.hit)
             {
                 // 背景
-                L += product(throughput, Float3(0.01, 0.01, 0.01));
+//                L += product(throughput, Float3(0.01, 0.01, 0.01));
+//                L += product(throughput, Float3(0.1, 0.1, 0.1));
                 break;
             }
             ray.org = info.pos;
@@ -1210,7 +1246,7 @@ namespace integrator
                 if (loop == 1 || !item)
                     Prr = 1;
                 else
-                    Prr = 0.5; // TODO: 改良の余地あり
+                    Prr = 0.33; // TODO: 改良の余地あり
 
 #ifdef PATHTRACING
                 Prr = 1;
@@ -1579,9 +1615,15 @@ int main(int argc, char** argv)
 
     return 0;
 #endif
-
+    /*
     const int Width = 1920 / 2;
     const int Height = 1080 / 2;
+    */
+
+    const int Width = 1280;
+    const int Height = 720;
+
+    integrator::initialzie_camera(Width, Height);
 
     bool end_flag = false;
 
@@ -1627,8 +1669,8 @@ int main(int argc, char** argv)
     // setup
     {
         integrator::global_binary_tree.bbox = hrt::BBox(
-            hmath::Float3(-50, -10, -50),
-            hmath::Float3(50,  50, 50));
+            hmath::Float3(-100, -50, -100),
+            hmath::Float3(100,  50, 100));
     
     }
 
@@ -1636,7 +1678,7 @@ int main(int argc, char** argv)
     p.c = 120; // TODO: ハイパラ
     p.rho = 0.01f;
     p.space_jitter_radius = 0.1f;
-    p.dir_jitter_radius = 0.1f;
+    p.dir_jitter_radius = 0.5f;
 
     constexpr int LOOP = 16;
 
@@ -1648,10 +1690,12 @@ int main(int argc, char** argv)
     int image_index = 0;
     for (int loop = 1; loop <= 16; ++loop)
     {
-        p.k = loop;
 
         image[loop] = FloatImage(Width, Height);
-        const int num_sample = 1 << loop;
+        int num_sample = 1 << (loop - 1);
+
+        p.k = loop;
+        p.num_sample = num_sample;
 
         printf("loop: %d\n", loop);
         
@@ -1660,9 +1704,14 @@ int main(int argc, char** argv)
         {
             const int tid = omp_get_thread_num();
 
+            if (tid == 0)
+            {
+                printf("[%d]", iy);
+            }
+
             for (int ix = 0; ix < Width; ++ix)
             {
-                const int current_seed = (ix + iy * 8192) * 8192 + tid;
+                const int current_seed = (ix + iy * 8192) * 8192;
 
                 hmath::Rng rng;
                 rng.set_seed(current_seed);
