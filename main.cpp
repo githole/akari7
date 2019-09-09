@@ -29,6 +29,185 @@
 
 constexpr int NUM_THREAD = 72;
 
+
+
+
+namespace filter
+{
+    void rgb2YCoCg(float r, float g, float b, float *Y, float *Co, float *Cg) {
+        //*Y = 1 / 4.0f * r + 1 / 2.0f * g + 1 / 4.0f * b;
+        //*Co = 1 / 2.0f * r + 0 / 1.0f * g - 1 / 2.0f * b;
+        //*Cg = -1 / 4.0f * r + 1 / 2.0f * g - 1 / 4.0f * b;
+        *Y = r;
+        *Co = g;
+        *Cg = b;
+    }
+    void YCoCg2rgb(float Y, float Co, float Cg, float *r, float *g, float *b) {
+        /*
+        *r = Y + Co - Cg;
+        *g = Y + 0 + Cg;
+        *b = Y - Co - Cg;
+        */
+        *r = Y;
+        *g = Co;
+        *b = Cg;
+    }
+
+    void set_vector(std::vector<float>& arr, const int x, const int y, const int ch, const int width, const int height, float *vector, int learn_radius) {
+        const int size = learn_radius * 2 + 1;
+
+        for (int oy = -learn_radius; oy <= learn_radius; ++oy) {
+            for (int ox = -learn_radius; ox <= learn_radius; ++ox) {
+                const int nx = ox + x;
+                const int ny = oy + y;
+                if (0 <= nx && nx < width && 0 <= ny && ny < height) {
+                    vector[(oy + learn_radius) * size + (ox + learn_radius)] = arr[(ny * width + nx) * 3 + ch];
+                }
+            }
+        }
+    }
+
+    float length(float *v0, float *v1, int size) {
+        float sum = 0;
+        for (int i = 0; i < size; ++i) {
+            const float a = v0[i] - v1[i];
+            sum += a * a;
+        }
+        return sum;
+    }
+
+    void nlm(std::vector<float>& arr0, std::vector<float>& arr1, const int width, const int height) {
+        const float sigma = 0.3f;
+
+        // 変換
+        for (int iy = 0; iy < height; ++iy) {
+            for (int ix = 0; ix < width; ++ix) {
+                const int idx = iy * width + ix;
+                const float r = arr0[idx * 3 + 0];
+                const float g = arr0[idx * 3 + 1];
+                const float b = arr0[idx * 3 + 2];
+                rgb2YCoCg(r, g, b, &arr0[idx * 3 + 0], &arr0[idx * 3 + 1], &arr0[idx * 3 + 2]);
+            }
+        }
+
+        // NLM
+        for (int iy = 0; iy < height; ++iy) {
+            std::cout << "Y: " << iy << "    \r";
+
+            std::vector<std::thread> thread_list;
+            int thread_id = 0;
+            for (int begin_x = 0; begin_x < width; begin_x += 16) {
+
+                int end_x = begin_x + 16;
+                if (end_x >= width)
+                    end_x = width;
+
+                std::thread thread([thread_id, begin_x, end_x, iy, width, height, sigma, &arr0, &arr1]() {
+                    hetc::set_thread_group(thread_id);
+
+                    const int learn_radius = 3;
+                    const int size = learn_radius * 2 + 1;
+                    const int compare_raidus = 3;
+                    for (int ix = begin_x; ix < end_x; ++ix) {
+
+                        for (int ch = 0; ch < 3; ++ch) {
+                            float vector0[size * size] = { 0 };
+                            set_vector(arr0, ix, iy, ch, width, height, vector0, learn_radius);
+
+                            const int compare_size = compare_raidus * 2 + 1;
+                            float weight_map[compare_size * compare_size] = { 0 };
+                            float value_map[compare_size * compare_size] = { 0 };
+
+                            // 探索
+                            for (int oy = -compare_raidus; oy <= compare_raidus; ++oy) {
+                                for (int ox = -compare_raidus; ox <= compare_raidus; ++ox) {
+                                    const int nx = ox + ix;
+                                    const int ny = oy + iy;
+                                    const int compare_idx = (oy + compare_raidus) * compare_size + (ox + compare_raidus);
+                                    if (0 <= nx && nx < width && 0 <= ny && ny < height) {
+                                        float vector1[size * size] = { 0 };
+                                        set_vector(arr0, nx, ny, ch, width, height, vector1, learn_radius);
+
+                                        // 重み計算
+                                        value_map[compare_idx] = arr0[(ny * width + nx) * 3 + ch];
+                                        weight_map[compare_idx] = length(vector0, vector1, size * size);
+                                    }
+                                    else {
+                                        weight_map[compare_idx] = -1;
+                                    }
+                                }
+                            }
+
+                            // 結果計算
+                            float sum = 0;
+                            float total_weight = 0;
+                            for (int cy = 0; cy < compare_size; ++cy) {
+                                for (int cx = 0; cx < compare_size; ++cx) {
+                                    const int compare_idx = cy * compare_size + cx;
+                                    if (weight_map[compare_idx] < 0)
+                                        continue;
+                                    const float weight = exp(-weight_map[compare_idx] / (sigma * sigma));
+                                    sum += value_map[compare_idx] * weight;
+                                    total_weight += weight;
+                                }
+                            }
+                            if (total_weight > 0)
+                                sum /= total_weight;
+                            arr1[(iy * width + ix) * 3 + ch] = sum;
+                        }
+                        const int idx = iy * width + ix;
+                        const float Y = arr1[idx * 3 + 0];
+                        const float Co = arr1[idx * 3 + 1];
+                        const float Cg = arr1[idx * 3 + 2];
+                        YCoCg2rgb(Y, Co, Cg, &arr1[idx * 3 + 0], &arr1[idx * 3 + 1], &arr1[idx * 3 + 2]);
+                    }
+                });
+                thread_list.push_back(std::move(thread));
+                ++thread_id;
+            }
+
+            for (auto& th : thread_list) {
+                th.join();
+            }
+        }
+    }
+
+    void median(std::vector<float>& input, std::vector<float>& output, const int width, const int height)
+    {
+        for (int iy = 0; iy < height; ++iy) {
+            std::cout << "Y: " << iy << "    \r";
+            for (int ix = 0; ix < width; ++ix) {
+                for (int ch = 0; ch < 3; ++ch) {
+                    float p[9] = {};
+                    int index = 0;
+                    for (int oy = -1; oy <= 1; ++oy) {
+                        for (int ox = -1; ox <= 1; ++ox) {
+
+                            int current_x = ix + ox;
+                            if (current_x < 0)
+                                current_x = 0;
+                            else if (width <= current_x)
+                                current_x = width - 1;
+
+                            int current_y = iy + oy;
+                            if (current_y < 0)
+                                current_y = 0;
+                            else if (height <= current_y)
+                                current_y = height - 1;
+
+                            p[index] = input[(current_x + current_y * width) * 3 + ch];
+                            ++index;
+                        }
+                    }
+                    std::sort(p, p + 9);
+                    output[(ix + iy * width) * 3 + ch] = p[4];
+                }
+            }
+        }
+    }
+}
+
+
 class FloatImage
 {
 private:
@@ -167,6 +346,8 @@ void save_image(const char* filename, FloatImage& image, bool enable_filter = fa
 
     fmath::PowGenerator degamma(1.0f / 2.2f);
 
+    const float scale = 2.0f;
+
     for (int iy = 0; iy < Height; ++iy) {
         for (int ix = 0; ix < Width; ++ix) {
             auto index = ix + iy * Width;
@@ -177,9 +358,9 @@ void save_image(const char* filename, FloatImage& image, bool enable_filter = fa
             //const double lumi = dot(p, rgb2y);
             //p[0] = p[1] = p[2] = image.data2(ix, iy)[0] / (N - 1) - (N / (N - 1)) * lumi * lumi;
 
-            fdata[index * 3 + 0] = (float)p[0];
-            fdata[index * 3 + 1] = (float)p[1];
-            fdata[index * 3 + 2] = (float)p[2];
+            fdata[index * 3 + 0] = scale * (float)p[0];
+            fdata[index * 3 + 1] = scale * (float)p[1];
+            fdata[index * 3 + 2] = scale * (float)p[2];
         }
     }
 
@@ -194,7 +375,17 @@ void save_image(const char* filename, FloatImage& image, bool enable_filter = fa
     }
 
     if (enable_filter) {
+        filter::nlm(fdata2, tonemapped_image, Width, Height);
+        for (int iy = 0; iy < Height; ++iy) {
+            for (int ix = 0; ix < Width; ++ix) {
+                auto index = ix + iy * Width;
+                uint8_tonemapped_image[index * 3 + 0] = (uint8_t)(tonemapped_image[index * 3 + 0] * 255);
+                uint8_tonemapped_image[index * 3 + 1] = (uint8_t)(tonemapped_image[index * 3 + 1] * 255);
+                uint8_tonemapped_image[index * 3 + 2] = (uint8_t)(tonemapped_image[index * 3 + 2] * 255);
+            }
+        }
         // filter::median(fdata2, tonemapped_image, Width, Height);
+#if 0
         for (int iy = 0; iy < Height; ++iy) {
             for (int ix = 0; ix < Width; ++ix) {
                 auto index = ix + iy * Width;
@@ -203,6 +394,7 @@ void save_image(const char* filename, FloatImage& image, bool enable_filter = fa
                 uint8_tonemapped_image[index * 3 + 2] = (uint8_t)(fdata2[index * 3 + 2] * 255);
             }
         }
+#endif
     }
     else {
         for (int iy = 0; iy < Height; ++iy) {
@@ -456,7 +648,7 @@ namespace integrator
             QuadTree(const QuadTree& tree) = delete;
             QuadTree& operator=(const QuadTree& tree) = delete;
 
-            QuadTree& operator=(QuadTree&& tree)
+            QuadTree& operator=(QuadTree&& tree) noexcept
             {
                 this->child = tree.child;
                 for (int c = 0; c < 4; ++c)
@@ -473,7 +665,7 @@ namespace integrator
                 return *this;
             }
 
-            QuadTree(QuadTree&& tree)
+            QuadTree(QuadTree&& tree) noexcept
             {
                 *this = std::move(tree);
             }
@@ -1654,9 +1846,7 @@ int main(int argc, char** argv)
 
     // メッシュ読み込み
     printf("Load and Build.\n");
-//    auto mesh = mesh::loadMesh("head.obj");
-//    auto mesh = mesh::loadMesh("C:/Code/VSProjects/pathological_mesher/pathological_mesher/rtcamp.obj");
-    auto mesh = mesh::loadMesh("rtcamp.obj");
+    auto mesh = mesh::loadMesh("rtcamp.obj_");
     {
         const auto numFace = mesh.index.size() / 3;
         mesh::oldlib::triangles.resize(numFace);
@@ -1810,18 +2000,19 @@ int main(int argc, char** argv)
                 if (!last)
                 {
                     sprintf(buf, "%03d.png", image_index);
+                    save_image(buf, result_image);
                 }
                 else
                 {
+                    end_flag.store(true);
                     sprintf(buf, "final_image.png", image_index);
+                    save_image(buf, result_image);
                 }
-                save_image(buf, result_image);
                 std::cout << "Saved: " << buf << std::endl;
                 ++image_index;
 
                 if (last)
                 {
-                    end_flag.store(true);
                     return;
                 }
 
@@ -2254,163 +2445,6 @@ int main(int argc, char** argv)
         }
 #endif
     }
-
-
-
-#if 0
-    // 時間監視スレッドを立てる
-    std::thread watcher([&end_flag, &image]() {
-        int image_index = 0;
-        char buf[256];
-
-        // 開始時間を取得しておく
-        auto start = std::chrono::system_clock::now();
-
-        auto tick_start = start;
-        for (;;) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 0.1秒眠る
-
-            // 15秒経過を計る
-            auto current = std::chrono::system_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(current - tick_start).count() >= 3 * 1000) {
-                // 画像出力
-                tick_start = current;
-
-                sprintf(buf, "%03d.png", image_index);
-                save_image(buf, image);
-                std::cout << "Saved: " << buf << std::endl;
-                ++image_index;
-            }
-
-            // 123秒経過を計る
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(current - start).count() >= 122 * 1000 /* 安全をみてちょっと早めにする */) {
-                // 画像出力して全部終了じゃい
-                end_flag = true;
-                save_image("final_image.png", image, true);
-                std::cout << "Saved: final_image.png" << std::endl;
-                return;
-            }
-        }
-    });
-
-    // workリストを適当にこしらえる
-    struct Work
-    {
-        int begin_x = 0;
-        int begin_y = 0;
-        int end_x = 0;
-        int end_y = 0;
-
-        FloatImage* image = nullptr;
-        std::atomic<bool> working = false;
-
-        Work() {}
-
-        Work(const Work& w) noexcept
-        {
-            begin_x = w.begin_x;
-            begin_y = w.begin_y;
-            end_x = w.end_x;
-            end_y = w.end_y;
-            image = w.image;
-            working.store(w.working.load());
-        }
-    };
-
-    // 時間の許す限り処理を続ける
-    std::vector<Work> work_list;
-    int work_list_index = 0;
-    int num_loop = 0;
-
-    static constexpr int BlockWidth = 32;
-    static constexpr int BlockHeight = 32;
-
-    for (int begin_y = 0; begin_y < Height; begin_y += BlockHeight) {
-        for (int begin_x = 0; begin_x < Width; begin_x += BlockWidth) {
-            Work w;
-
-            w.begin_x = begin_x;
-            w.begin_y = begin_y;
-            w.end_x = hmath::clamp(begin_x + BlockWidth, 0, Width);
-            w.end_y = hmath::clamp(begin_y + BlockHeight, 0, Height);
-            w.image = &image;
-
-            work_list.push_back(w);
-        }
-    }
-
-    // スレッドに処理を振り分ける
-    std::vector<std::thread> thread_list;
-    std::mutex work_list_mutex;
-
-    for (int thread_id = 0; thread_id < NUM_THREAD; ++thread_id) {
-        std::thread thread([Width, Height, &end_flag, thread_id, &work_list, &work_list_index, &num_loop, &work_list_mutex]() {
-            hetc::set_thread_group(thread_id);
-
-            hmath::Rng rng;
-            rng.set_seed(thread_id);
-
-            for (;;) {
-                Work* current_work = nullptr;
-                {
-                    std::lock_guard<std::mutex> lock(work_list_mutex);
-
-                    if (!work_list[work_list_index].working.load()) {
-                        current_work = &work_list[work_list_index];
-                        work_list[work_list_index].working.store(true);
-                    }
-                    work_list_index++;
-                    if (work_list_index == work_list.size()) {
-                        work_list_index = 0;
-                        ++num_loop;
-                    }
-                }
-
-                if (current_work == nullptr) {
-                    continue;
-                }
-
-                // タスク処理
-                for (int iy = current_work->begin_y; iy < current_work->end_y; ++iy) {
-                    for (int ix = current_work->begin_x; ix < current_work->end_x; ++ix) {
-
-                        auto& p = (*current_work->image)(ix, iy);
-                        auto& vp = (*current_work->image).data2(ix, iy);
-
-                        for (int batch = 0; batch < 1; ++batch) {
-                            if (end_flag)
-                                return;
-
-                            const int current_seed = (ix + iy * 8192) * 8192 + num_loop;
-                            const auto ret = integrator::get_radiance(Width, Height, ix, iy, current_seed);
-
-                            if (is_valid(ret)) {
-                                const auto dret = hmath::Double3(ret[0], ret[1], ret[2]);
-                                p += dret;
-
-                                // 分散計算用
-                                const auto lumi = dot(dret, rgb2y);
-                                vp[0] += lumi * lumi;
-
-                                current_work->image->samples(ix, iy) += 1;
-                            }
-                        }
-                    }
-                }
-
-                // 完了
-                current_work->working.store(false);
-            }
-        });
-
-        thread_list.push_back(std::move(thread));
-    }
-
-    for (auto& t : thread_list) {
-        t.join();
-    }
-
-#endif
     watcher.join();
 
     return 0;
